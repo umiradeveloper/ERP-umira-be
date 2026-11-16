@@ -1,0 +1,55 @@
+{
+  "_keterangan": "Pemetaan role SuperApps (kolom role.nama_role) ke role ERP Umira. Satu role SuperApps boleh mendapat beberapa role ERP. Role yang tidak ada di daftar ini atau berisi [] tidak bisa login ke ERP. Ubah sesuai kebijakan perusahaan lalu restart backend.",
+  "Admin": ["Administrator"],
+  "Chief IT": ["Administrator"],
+  "IT Engineer": ["Administrator"],
+  "CTO": ["Administrator"],
+
+  "CEO": ["Direktur"],
+  "COO": ["Direktur"],
+  "CFO": ["Direktur", "Finance"],
+  "CMO": ["Direktur"],
+  "General Manager": ["Direktur"],
+
+  "GM Construction": ["Direktur", "Project Manager"],
+  "Manager Construction": ["Project Manager"],
+  "Project manager": ["Project Manager"],
+
+  "Engineering": ["Site Engineer"],
+  "Manager Engineering": ["Site Engineer", "Estimator"],
+  "Quality Surveyor": ["Estimator"],
+  "QHSE": ["Site Engineer"],
+  "Manager QHSE": ["Site Engineer"],
+
+  "Busdev": ["Estimator"],
+  "Kordinator Busdev": ["Estimator"],
+  "Chief Busdev": ["Estimator"],
+  "GM Busdev": ["Estimator", "Direktur"],
+  "Research & Development": ["Estimator"],
+
+  "SCM": ["Procurement"],
+  "Staff Procurement": ["Procurement"],
+  "Admin Procurement": ["Procurement"],
+  "Manager Procurement": ["Procurement"],
+  "Chief Procurement": ["Procurement"],
+  "GM Procurement": ["Procurement"],
+
+  "Staff Cost Control": ["Cost Controller"],
+  "Manager Cost Control": ["Cost Controller"],
+  "GM Cost Control": ["Cost Controller"],
+
+  "FAT": ["Finance", "Accountant"],
+  "Chief FAT": ["Finance", "Accountant"],
+  "GM Finance And Tax": ["Finance", "Accountant"],
+  "Admin Checklist Pembayaran": ["Finance"],
+
+  "Asset & Gudang": ["Asset Manager"],
+  "Manager Asset": ["Asset Manager"],
+
+  "HR & GA": [],
+  "Manager HR & GA": [],
+  "SAM": [],
+  "Management Trainee": [],
+  "Kandidat": [],
+  "Vendor": []
+}
