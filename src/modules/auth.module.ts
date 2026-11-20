@@ -146,7 +146,8 @@ export class AuthController {
   @Public()
   @Get('auth/config')
   config() {
-    return { tenant: this.auth.fixedTenant, superapps: this.auth.superappsEnabled };
+    // SHOW_DEMO=true menampilkan tombol akun demo di halaman login (default: false)
+    return { tenant: this.auth.fixedTenant, superapps: this.auth.superappsEnabled, demo: process.env.SHOW_DEMO === 'true' };
   }
 
   @Public()

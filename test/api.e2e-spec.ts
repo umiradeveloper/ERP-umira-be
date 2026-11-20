@@ -400,7 +400,7 @@ describe('Contractor ERP API (e2e)', () => {
 
     it('config login menunjukkan perusahaan tetap & SuperApps aktif', async () => {
       const r = await request(http).get('/api/v1/auth/config').expect(200);
-      expect(r.body.data).toEqual({ tenant: A, superapps: true });
+      expect(r.body.data).toEqual({ tenant: A, superapps: true, demo: false });
     });
     it('login dengan email SuperApps (tanpa kode perusahaan) membuat user ERP dengan role terpetakan', async () => {
       const r = await loginSa('slamet.uji@umira.test').expect(201);
