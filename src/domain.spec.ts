@@ -119,4 +119,14 @@ describe('Validasi jurnal manual', () => {
   it('balance dihitung dengan desimal tepat (0.1 + 0.2 = 0.3)', () => {
     expect(() => validateJournalLines([{ debit: '0.1', credit: '0' }, { debit: '0.2', credit: '0' }, { debit: '0', credit: '0.3' }])).not.toThrow();
   });
+
+  it('overhead nominal: persentase dihitung dari biaya langsung', () => {
+    const t = { overheadPct: D(5), contingencyPct: D(3), profitPct: D(10), taxPct: D(11) };
+    const r = calcTender({ ...t, overheadAmount: D('2500000') }, [{ amount: D('40000000'), category: 'MATERIAL' }, { amount: D('10000000'), category: 'LABOR' }]);
+    expect(r.overhead.toString()).toBe('2500000');
+    expect(r.overheadPct).toBe(5);
+    // contingency tetap % dari biaya langsung; profit dari (langsung + overhead + contingency)
+    expect(r.contingency.toString()).toBe('1500000');
+    expect(r.profit.toString()).toBe('5400000');
+  });
 });

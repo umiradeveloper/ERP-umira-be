@@ -1,7 +1,7 @@
 import { Body, Controller, Get, Injectable, Module, Param, Patch, Post, Put } from '@nestjs/common';
 import { ApiTags } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
-import { IsDateString, IsIn, IsNumberString, IsOptional, IsString, ValidateNested } from 'class-validator';
+import { IsDateString, IsIn, IsNumberString, IsOptional, IsString, ValidateNested, ValidateIf } from 'class-validator';
 import { CostCategory, Prisma, Tender, TenderItem } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuthUser, CurrentUser, Perm } from '../common/auth';
@@ -16,6 +16,8 @@ class TenderDto {
   @IsOptional() @IsString() location?: string;
   @IsOptional() @IsDateString() deadline?: string;
   @IsOptional() @IsNumberString() overheadPct?: string;
+  /** Overhead nominal (Rp); "" = kembali memakai persentase */
+  @IsOptional() @ValidateIf((o) => o.overheadAmount !== '') @IsNumberString() overheadAmount?: string;
   @IsOptional() @IsNumberString() contingencyPct?: string;
   @IsOptional() @IsNumberString() profitPct?: string;
   @IsOptional() @IsNumberString() taxPct?: string;
@@ -42,17 +44,19 @@ class DecisionDto {
 }
 
 /** Kalkulasi estimator (PRD §5.3): direct cost → overhead → contingency → profit → pajak */
-export function calcTender(t: Pick<Tender, 'overheadPct' | 'contingencyPct' | 'profitPct' | 'taxPct'>, items: Pick<TenderItem, 'amount' | 'category'>[]) {
+export function calcTender(t: Pick<Tender, 'overheadPct' | 'contingencyPct' | 'profitPct' | 'taxPct'> & { overheadAmount?: Prisma.Decimal | null }, items: Pick<TenderItem, 'amount' | 'category'>[]) {
   const directCost = sumD(items.map((i) => i.amount));
   const byCategory: Record<string, Prisma.Decimal> = {};
   for (const i of items) byCategory[i.category] = (byCategory[i.category] ?? D(0)).plus(i.amount);
-  const overhead = round2(directCost.mul(t.overheadPct).div(100));
+  // Overhead: nominal (bila diisi) atau persentase dari biaya langsung
+  const overhead = t.overheadAmount != null ? round2(D(t.overheadAmount)) : round2(directCost.mul(t.overheadPct).div(100));
+  const overheadPctEff = directCost.gt(0) ? overhead.div(directCost).mul(100).toDecimalPlaces(4).toNumber() : 0;
   const contingency = round2(directCost.mul(t.contingencyPct).div(100));
   const costTotal = directCost.plus(overhead).plus(contingency);
   const profit = round2(costTotal.mul(t.profitPct).div(100));
   const subtotal = costTotal.plus(profit);
   const tax = round2(subtotal.mul(t.taxPct).div(100));
-  return { directCost, byCategory, overhead, contingency, profit, subtotal, tax, grandTotal: subtotal.plus(tax) };
+  return { directCost, byCategory, overhead, overheadPct: overheadPctEff, contingency, profit, subtotal, tax, grandTotal: subtotal.plus(tax) };
 }
 
 @Injectable()
@@ -93,6 +97,7 @@ export class TendersService {
           notes: dto.notes,
           createdBy: u.userId,
           ...(dto.overheadPct ? { overheadPct: D(dto.overheadPct) } : {}),
+        ...(dto.overheadAmount ? { overheadAmount: this.nonNegative(dto.overheadAmount, 'Overhead') } : {}),
           ...(dto.contingencyPct ? { contingencyPct: D(dto.contingencyPct) } : {}),
           ...(dto.profitPct ? { profitPct: D(dto.profitPct) } : {}),
           ...(dto.taxPct ? { taxPct: D(dto.taxPct) } : {}),
@@ -107,6 +112,12 @@ export class TendersService {
     if (!['DRAFT', 'REVIEW'].includes(t.status)) throw new BusinessError('Tender yang sudah diajukan tidak dapat diubah');
   }
 
+  private nonNegative(v: string, label: string) {
+    const n = D(v);
+    if (n.lt(0)) throw new BusinessError(`${label} tidak boleh negatif`);
+    return round2(n);
+  }
+
   async update(u: AuthUser, id: string, dto: TenderDto) {
     const t = notFound(await this.prisma.tender.findFirst({ where: { id, tenantId: u.tenantId } }), 'Tender');
     this.assertEditable(t);
@@ -116,12 +127,13 @@ export class TendersService {
         title: dto.title,
         customerId: dto.customerId || null,
         location: dto.location,
-        deadline: dto.deadline ? new Date(dto.deadline) : null,
+        deadline: dto.deadline === undefined ? undefined : dto.deadline ? new Date(dto.deadline) : null,
         notes: dto.notes,
-        overheadPct: dto.overheadPct ? D(dto.overheadPct) : undefined,
-        contingencyPct: dto.contingencyPct ? D(dto.contingencyPct) : undefined,
-        profitPct: dto.profitPct ? D(dto.profitPct) : undefined,
-        taxPct: dto.taxPct ? D(dto.taxPct) : undefined,
+        overheadPct: dto.overheadPct !== undefined && dto.overheadPct !== '' ? D(dto.overheadPct) : undefined,
+        overheadAmount: dto.overheadAmount === undefined ? undefined : dto.overheadAmount === '' ? null : this.nonNegative(dto.overheadAmount, 'Overhead'),
+        contingencyPct: dto.contingencyPct !== undefined && dto.contingencyPct !== '' ? D(dto.contingencyPct) : undefined,
+        profitPct: dto.profitPct !== undefined && dto.profitPct !== '' ? D(dto.profitPct) : undefined,
+        taxPct: dto.taxPct !== undefined && dto.taxPct !== '' ? D(dto.taxPct) : undefined,
       },
     });
     await this.audit.log(u, 'UPDATE', 'Tender', id, dto as any);

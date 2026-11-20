@@ -275,6 +275,8 @@ model Tender {
   status       TenderStatus @default(DRAFT)
   version      Int          @default(1)
   overheadPct  Decimal      @default(5) @db.Decimal(7, 4)
+  /// Overhead diinput sebagai nominal (Rp); bila diisi, persentase overhead dihitung dari biaya langsung
+  overheadAmount Decimal?   @db.Decimal(18, 2)
   contingencyPct Decimal    @default(3) @db.Decimal(7, 4)
   profitPct    Decimal      @default(10) @db.Decimal(7, 4)
   taxPct       Decimal      @default(11) @db.Decimal(7, 4)
