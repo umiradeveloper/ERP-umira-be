@@ -15,7 +15,10 @@
     "test": "jest",
     "test:e2e": "E2E=1 LOGIN_RATE_LIMIT=1000 jest --runInBand",
     "postinstall": "prisma generate",
-    "tenant:create": "ts-node prisma/create-tenant.ts"
+    "tenant:create": "ts-node prisma/create-tenant.ts",
+    "tenant:disable": "ts-node prisma/tenant-status.ts --disable",
+    "tenant:enable": "ts-node prisma/tenant-status.ts --enable",
+    "tenant:delete": "ts-node prisma/tenant-delete.ts"
   },
   "prisma": {
     "seed": "ts-node prisma/seed.ts"
