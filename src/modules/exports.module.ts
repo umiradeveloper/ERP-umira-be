@@ -95,14 +95,14 @@ export class ExportsService {
         this.check(u, r.perm);
         const rows = (await this.projects.list(u)).map((p) => ({
           code: p.code, name: p.name, owner: p.ownerName, status: STATUS[p.status], contract: n(p.contractValue),
-          bkAwal: n(p.bkAwal), puAwal: n(p.puAwal), bkpuAwal: p.bkpuAwalPct,
-          bkNow: n(p.bkSaatIni), puNow: n(p.puSaatIni), bkpuNow: p.bkpuSaatIniPct,
+          bkpuPenetapan: p.bkpuPenetapanPct === null ? null : n(p.bkpuPenetapanPct), bkAwal: n(p.bkAwal), puAwal: n(p.puAwal), bkpuAwal: p.bkpuAwalPct,
+          bkNow: n(p.bkSaatIni), puNow: n(p.puSaatIni), bkpuNow: p.bkpuSaatIniPct, efisiensi: p.efisiensiPct,
         }));
         wb = await this.workbook(u, title, [
           { header: 'Kode', key: 'code', width: 16 }, { header: 'Proyek', key: 'name', width: 42 }, { header: 'Owner', key: 'owner', width: 28 },
           { header: 'Status', key: 'status', width: 12 }, { header: 'Nilai kontrak', key: 'contract', money: true },
-          { header: 'BK awal (RAP)', key: 'bkAwal', money: true }, { header: 'PU awal (kontrak awal)', key: 'puAwal', money: true }, { header: 'BK/PU awal (%)', key: 'bkpuAwal', num: true, width: 13 },
-          { header: 'BK saat ini (biaya aktual)', key: 'bkNow', money: true }, { header: 'PU saat ini (progres)', key: 'puNow', money: true }, { header: 'BK/PU saat ini (%)', key: 'bkpuNow', num: true, width: 15 },
+          { header: 'BK/PU penetapan (%)', key: 'bkpuPenetapan', num: true, width: 15 }, { header: 'BK awal (RAP)', key: 'bkAwal', money: true }, { header: 'PU awal (kontrak awal)', key: 'puAwal', money: true }, { header: 'BK/PU awal (%)', key: 'bkpuAwal', num: true, width: 13 },
+          { header: 'BK saat ini (biaya aktual)', key: 'bkNow', money: true }, { header: 'PU saat ini (progres)', key: 'puNow', money: true }, { header: 'BK/PU saat ini (%)', key: 'bkpuNow', num: true, width: 15 }, { header: 'Efisiensi (poin %)', key: 'efisiensi', num: true, width: 15 },
         ], rows, {
           contract: rows.reduce((a, x) => a + (x.contract ?? 0), 0), bkAwal: rows.reduce((a, x) => a + (x.bkAwal ?? 0), 0), puAwal: rows.reduce((a, x) => a + (x.puAwal ?? 0), 0),
           bkNow: rows.reduce((a, x) => a + (x.bkNow ?? 0), 0), puNow: rows.reduce((a, x) => a + (x.puNow ?? 0), 0),

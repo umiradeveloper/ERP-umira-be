@@ -1,6 +1,6 @@
 import { Body, Controller, Get, Injectable, Module, Param, Patch, Post } from '@nestjs/common';
 import { ApiTags } from '@nestjs/swagger';
-import { IsDateString, IsIn, IsInt, IsNumberString, IsOptional, IsString, Min } from 'class-validator';
+import { IsDateString, IsIn, IsInt, IsNumberString, IsOptional, IsString, Min, ValidateIf } from 'class-validator';
 import { CostCategory, Prisma, ProjectStatus } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuthUser, CurrentUser, Perm } from '../common/auth';
@@ -19,6 +19,7 @@ class ProjectDto {
   @IsOptional() @IsNumberString() retentionPct?: string;
   @IsOptional() @IsDateString() startDate?: string;
   @IsOptional() @IsDateString() endDate?: string;
+  @IsOptional() @IsNumberString() bkpuPenetapanPct?: string;
 }
 class ProjectPatchDto {
   @IsOptional() @IsIn(['SETUP', 'ACTIVE', 'ON_HOLD', 'COMPLETION', 'CLOSED', 'CANCELLED']) status?: ProjectStatus;
@@ -26,6 +27,10 @@ class ProjectPatchDto {
   @IsOptional() @IsString() location?: string;
   @IsOptional() @IsDateString() startDate?: string;
   @IsOptional() @IsDateString() endDate?: string;
+  /** BK/PU penetapan (%); kirim "" untuk mengosongkan */
+  @IsOptional() @ValidateIf((o) => o.bkpuPenetapanPct !== '') @IsNumberString() bkpuPenetapanPct?: string;
+  /** id file foto proyek; kirim "" untuk menghapus */
+  @IsOptional() @IsString() coverFileId?: string;
 }
 class ProgressDto {
   @IsDateString() reportDate!: string;
@@ -200,12 +205,22 @@ export class ProjectsService {
         const bkAwal = firstBudget.get(p.id) ?? ZERO;
         const puNow = p.contractValue.mul(D(p.progressPct)).div(100).toDecimalPlaces(2);
         const bkNow = actMap.get(p.id) ?? ZERO;
+        const awal = ratio(bkAwal, puAwal);
+        const now = ratio(bkNow, puNow);
         return [p.id, {
-          bkAwal, puAwal, bkpuAwalPct: ratio(bkAwal, puAwal),
-          bkSaatIni: bkNow, puSaatIni: puNow, bkpuSaatIniPct: ratio(bkNow, puNow),
+          bkAwal, puAwal, bkpuAwalPct: awal,
+          bkSaatIni: bkNow, puSaatIni: puNow, bkpuSaatIniPct: now,
+          // Efisiensi (poin %) = BK/PU awal − BK/PU saat ini; positif = lebih hemat dari rencana awal
+          efisiensiPct: awal !== null && now !== null ? Math.round((awal - now) * 100) / 100 : null,
         }] as const;
       }),
     );
+  }
+
+  private pctValue(v: string) {
+    const n = D(v);
+    if (n.lt(0) || n.gt(999)) throw new BusinessError('BK/PU penetapan harus antara 0 dan 999%');
+    return n.toDecimalPlaces(2);
   }
 
   async get(u: AuthUser, id: string) {
@@ -223,10 +238,12 @@ export class ProjectsService {
     ]);
     const buckets = await this.cost.buckets(u.tenantId, [id]);
     const cost = this.cost.summarize(buckets.get(id));
+    const bkpu = (await this.bkpu(u.tenantId, [p])).get(p.id)!;
     const billedGross = invoices.filter((i) => !['DRAFT', 'CANCELLED'].includes(i.status)).reduce((a, i) => a.plus(i.grossAmount), ZERO);
     const received = invoices.reduce((a, i) => a.plus(i.paidAmount), ZERO);
     return {
       ...p,
+      ...bkpu,
       progress,
       dailyReports,
       cost,
@@ -273,6 +290,7 @@ export class ProjectsService {
           managerName: dto.managerName, contractValue: D(dto.contractValue),
           retentionPct: dto.retentionPct ? D(dto.retentionPct) : undefined,
           startDate: dto.startDate ? new Date(dto.startDate) : null, endDate: dto.endDate ? new Date(dto.endDate) : null,
+          bkpuPenetapanPct: dto.bkpuPenetapanPct ? this.pctValue(dto.bkpuPenetapanPct) : null,
           budgets: { create: { tenantId: u.tenantId, name: 'Baseline', isBaseline: true } },
         },
       });
@@ -286,11 +304,22 @@ export class ProjectsService {
     if (dto.status && dto.status !== p.status && !TRANSITIONS[p.status].includes(dto.status)) {
       throw new BusinessError(`Status proyek tidak bisa berubah dari ${p.status} ke ${dto.status}`);
     }
+    let coverFileId: string | null | undefined;
+    if (dto.coverFileId !== undefined) {
+      if (dto.coverFileId === '') coverFileId = null;
+      else {
+        const f = notFound(await this.prisma.fileObject.findFirst({ where: { id: dto.coverFileId, tenantId: u.tenantId, entityType: 'Project', entityId: id } }), 'Foto');
+        if (!f.mimeType.startsWith('image/')) throw new BusinessError('Foto proyek harus berupa gambar (JPG, PNG, WEBP)');
+        coverFileId = f.id;
+      }
+    }
     const res = await this.prisma.project.update({
       where: { id },
       data: {
         status: dto.status, managerName: dto.managerName, location: dto.location,
         startDate: dto.startDate ? new Date(dto.startDate) : undefined, endDate: dto.endDate ? new Date(dto.endDate) : undefined,
+        bkpuPenetapanPct: dto.bkpuPenetapanPct === undefined ? undefined : dto.bkpuPenetapanPct === '' ? null : this.pctValue(dto.bkpuPenetapanPct),
+        coverFileId,
       },
     });
     await this.audit.log(u, dto.status && dto.status !== p.status ? `STATUS_${dto.status}` : 'UPDATE', 'Project', id, { before: { status: p.status }, after: dto });

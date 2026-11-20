@@ -332,6 +332,10 @@ model Project {
   endDate       DateTime?
   progressPct   Decimal       @default(0) @db.Decimal(7, 4)
   plannedPct    Decimal       @default(0) @db.Decimal(7, 4)
+  /// BK/PU penetapan (%) — diisi manual sesuai penetapan manajemen
+  bkpuPenetapanPct Decimal?   @db.Decimal(7, 2)
+  /// Foto proyek (FileObject kategori "cover")
+  coverFileId   String?       @db.Char(36)
   status        ProjectStatus @default(SETUP)
   createdAt     DateTime      @default(now())
   updatedAt     DateTime      @updatedAt

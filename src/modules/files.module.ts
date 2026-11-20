@@ -117,6 +117,7 @@ export class FilesService {
     const f = notFound(await this.prisma.fileObject.findFirst({ where: { id, tenantId: u.tenantId } }), 'File');
     await this.assertEntity(u, f.entityType, f.entityId, 'write');
     await this.prisma.fileObject.delete({ where: { id } });
+    if (f.entityType === 'Project') await this.prisma.project.updateMany({ where: { tenantId: u.tenantId, coverFileId: id }, data: { coverFileId: null } });
     this.storage.remove(f.storageKey);
     await this.audit.log(u, 'DELETE_FILE', f.entityType, f.entityId, { fileName: f.fileName });
     return { ok: true };

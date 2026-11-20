@@ -444,4 +444,32 @@ describe('Contractor ERP API (e2e)', () => {
       await request(http).post('/api/v1/superapps/sync-users').set(as('bAdmin')).expect(422);
     });
   });
+
+  describe('BK/PU penetapan, efisiensi & foto proyek', () => {
+    let pid: string;
+    it('BK/PU penetapan bisa diisi saat buat, diubah dan dikosongkan', async () => {
+      const p = await request(http).post('/api/v1/projects').set(as('admin')).send({ name: 'Proyek BKPU', contractValue: '2000000000', bkpuPenetapanPct: '88.5' }).expect(201);
+      pid = p.body.data.id;
+      let d = await request(http).get(`/api/v1/projects/${pid}`).set(as('admin')).expect(200);
+      expect(Number(d.body.data.bkpuPenetapanPct)).toBe(88.5);
+      expect(d.body.data).toHaveProperty('efisiensiPct', null);
+      await request(http).patch(`/api/v1/projects/${pid}`).set(as('admin')).send({ bkpuPenetapanPct: '90.25' }).expect(200);
+      const list = await request(http).get('/api/v1/projects').set(as('admin')).expect(200);
+      expect(Number(list.body.data.find((x: any) => x.id === pid).bkpuPenetapanPct)).toBe(90.25);
+      await request(http).patch(`/api/v1/projects/${pid}`).set(as('admin')).send({ bkpuPenetapanPct: '' }).expect(200);
+      d = await request(http).get(`/api/v1/projects/${pid}`).set(as('admin')).expect(200);
+      expect(d.body.data.bkpuPenetapanPct).toBeNull();
+      await request(http).patch(`/api/v1/projects/${pid}`).set(as('admin')).send({ bkpuPenetapanPct: '1200' }).expect(422);
+    });
+    it('foto proyek harus gambar milik proyek itu; terhapus otomatis saat file dihapus', async () => {
+      const pdf = await request(http).post('/api/v1/files').set(as('admin')).field('entityType', 'Project').field('entityId', pid).attach('files', Buffer.from('%PDF-1.4'), { filename: 'a.pdf', contentType: 'application/pdf' }).expect(201);
+      await request(http).patch(`/api/v1/projects/${pid}`).set(as('admin')).send({ coverFileId: pdf.body.data[0].id }).expect(422);
+      const img = await request(http).post('/api/v1/files').set(as('admin')).field('entityType', 'Project').field('entityId', pid).attach('files', Buffer.from([0x89, 0x50, 0x4e, 0x47]), { filename: 'foto.png', contentType: 'image/png' }).expect(201);
+      await request(http).patch(`/api/v1/projects/${pid}`).set(as('admin')).send({ coverFileId: img.body.data[0].id }).expect(200);
+      expect((await request(http).get(`/api/v1/projects/${pid}`).set(as('admin'))).body.data.coverFileId).toBe(img.body.data[0].id);
+      await request(http).delete(`/api/v1/files/${img.body.data[0].id}`).set(as('admin')).expect(200);
+      expect((await request(http).get(`/api/v1/projects/${pid}`).set(as('admin'))).body.data.coverFileId).toBeNull();
+      await request(http).patch(`/api/v1/projects/${pid}`).set(as('admin')).send({ coverFileId: '00000000-0000-0000-0000-000000000000' }).expect(404);
+    });
+  });
 });
