@@ -223,30 +223,33 @@ export class TendersService {
           bqItems: {
             create: bq.map(({ i, unitPrice, amount }) => ({
               tenantId: u.tenantId, sortOrder: i.sortOrder, section: i.section, code: i.code, description: i.description,
-              unit: i.unit, category: i.category, costCode: i.costCode, quantity: i.quantity, unitPrice, amount,
+              unit: i.unit, category: i.category, costCode: i.costCode, quantity: i.quantity, unitPrice, amount, estUnitCost: i.unitCost,
             })),
           },
-          budgets: {
-            create: {
-              tenantId: u.tenantId,
-              name: `Baseline dari ${t.number}`,
-              isBaseline: true,
-              approvedAt: new Date(),
-              items: {
-                create: [
-                  ...t.items.map((i) => ({
-                    tenantId: u.tenantId, wbsCode: i.section, costCode: i.costCode, category: i.category,
-                    description: `${i.code} ${i.description}`, quantity: i.quantity, unit: i.unit, unitRate: i.unitCost, amount: i.amount,
-                  })),
-                  ...(totals.overhead.gt(0)
-                    ? [{ tenantId: u.tenantId, category: 'OVERHEAD' as CostCategory, description: 'Overhead proyek', amount: totals.overhead, quantity: D(1), unitRate: totals.overhead }]
-                    : []),
-                  ...(totals.contingency.gt(0)
-                    ? [{ tenantId: u.tenantId, category: 'OTHER' as CostCategory, description: 'Contingency', amount: totals.contingency, quantity: D(1), unitRate: totals.contingency }]
-                    : []),
-                ],
-              },
-            },
+        },
+      });
+      // RAP disusun setelah menang tender: draf RAP mengikuti struktur RAB (acuan),
+      // volume = volume RAB, harga satuan = estimasi biaya tender. Diperiksa & ditetapkan di tab RAP proyek.
+      const rab = await tx.bqItem.findMany({ where: { projectId: project.id }, orderBy: { sortOrder: 'asc' } });
+      const indirect = [
+        ...(totals.overhead.gt(0) ? [{ code: 'BTL.1', description: 'Overhead proyek', category: 'OVERHEAD' as CostCategory, amount: totals.overhead }] : []),
+        ...(totals.contingency.gt(0) ? [{ code: 'BTL.2', description: 'Contingency', category: 'OTHER' as CostCategory, amount: totals.contingency }] : []),
+      ];
+      await tx.budget.create({
+        data: {
+          tenantId: u.tenantId, projectId: project.id, name: `RAP ${project.code}`, isBaseline: true, revision: 1,
+          items: {
+            create: [
+              ...rab.map((r, k) => ({
+                tenantId: u.tenantId, bqItemId: r.id, sortOrder: k, section: r.section, code: r.code, wbsCode: r.section, costCode: r.costCode,
+                category: r.category, description: r.description, unit: r.unit, quantity: r.quantity, unitRate: r.estUnitCost,
+                amount: round2(r.quantity.mul(r.estUnitCost)),
+              })),
+              ...indirect.map((x, k) => ({
+                tenantId: u.tenantId, sortOrder: rab.length + k, section: 'Biaya tidak langsung', code: x.code, wbsCode: 'Biaya tidak langsung',
+                category: x.category, description: x.description, unit: 'ls', quantity: D(1), unitRate: x.amount, amount: x.amount,
+              })),
+            ],
           },
         },
       });

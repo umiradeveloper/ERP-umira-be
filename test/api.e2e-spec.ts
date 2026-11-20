@@ -447,19 +447,14 @@ describe('Contractor ERP API (e2e)', () => {
 
   describe('BK/PU penetapan, efisiensi & foto proyek', () => {
     let pid: string;
-    it('BK/PU penetapan bisa diisi saat buat, diubah dan dikosongkan', async () => {
-      const p = await request(http).post('/api/v1/projects').set(as('admin')).send({ name: 'Proyek BKPU', contractValue: '2000000000', bkpuPenetapanPct: '88.5' }).expect(201);
+    it('BK/PU penetapan tidak bisa diisi manual; kosong sampai RAP ditetapkan', async () => {
+      await request(http).post('/api/v1/projects').set(as('admin')).send({ name: 'Proyek BKPU', contractValue: '2000000000', bkpuPenetapanPct: '88.5' }).expect(400);
+      const p = await request(http).post('/api/v1/projects').set(as('admin')).send({ name: 'Proyek BKPU', contractValue: '2000000000' }).expect(201);
       pid = p.body.data.id;
-      let d = await request(http).get(`/api/v1/projects/${pid}`).set(as('admin')).expect(200);
-      expect(Number(d.body.data.bkpuPenetapanPct)).toBe(88.5);
-      expect(d.body.data).toHaveProperty('efisiensiPct', null);
-      await request(http).patch(`/api/v1/projects/${pid}`).set(as('admin')).send({ bkpuPenetapanPct: '90.25' }).expect(200);
-      const list = await request(http).get('/api/v1/projects').set(as('admin')).expect(200);
-      expect(Number(list.body.data.find((x: any) => x.id === pid).bkpuPenetapanPct)).toBe(90.25);
-      await request(http).patch(`/api/v1/projects/${pid}`).set(as('admin')).send({ bkpuPenetapanPct: '' }).expect(200);
-      d = await request(http).get(`/api/v1/projects/${pid}`).set(as('admin')).expect(200);
+      const d = await request(http).get(`/api/v1/projects/${pid}`).set(as('admin')).expect(200);
       expect(d.body.data.bkpuPenetapanPct).toBeNull();
-      await request(http).patch(`/api/v1/projects/${pid}`).set(as('admin')).send({ bkpuPenetapanPct: '1200' }).expect(422);
+      expect(d.body.data).toHaveProperty('efisiensiPct', null);
+      await request(http).patch(`/api/v1/projects/${pid}`).set(as('admin')).send({ bkpuPenetapanPct: '90.25' }).expect(400);
     });
     it('foto proyek harus gambar milik proyek itu; terhapus otomatis saat file dihapus', async () => {
       const pdf = await request(http).post('/api/v1/files').set(as('admin')).field('entityType', 'Project').field('entityId', pid).attach('files', Buffer.from('%PDF-1.4'), { filename: 'a.pdf', contentType: 'application/pdf' }).expect(201);
@@ -499,6 +494,57 @@ describe('Contractor ERP API (e2e)', () => {
         .send({ items: [{ section: 'III. PEKERJAAN STRUKTUR ATAS — GEDUNG UTAMA LANTAI 1 SAMPAI DENGAN LANTAI ATAP TERMASUK TANGGA DAN RAMP', code: 'III.1', description: long, unit: 'm3', category: 'MATERIAL', quantity: '1', unitCost: '1' }] })
         .expect(200);
       expect(r.body.data.items[0].description).toBe(long);
+    });
+  });
+
+  describe('RAP disusun setelah menang tender dengan RAB sebagai acuan', () => {
+    let projectId: string;
+    it('menang tender → RAB dibuat dan draf RAP mengikuti struktur RAB (belum ditetapkan)', async () => {
+      const t = await request(http).post('/api/v1/tenders').set(as('admin')).send({ title: 'Tender RAP', overheadAmount: '1000000', contingencyPct: '0' }).expect(201);
+      const tid = t.body.data.id;
+      await request(http).put(`/api/v1/tenders/${tid}/items`).set(as('admin')).send({ items: [
+        { section: 'I. Persiapan', code: 'I.1', description: 'Mobilisasi', unit: 'ls', category: 'EQUIPMENT', quantity: '1', unitCost: '5000000' },
+        { section: 'II. Struktur', code: 'II.1', description: 'Beton K-300', unit: 'm3', category: 'MATERIAL', quantity: '10.5', unitCost: '1200000.5' },
+      ] }).expect(200);
+      await request(http).post(`/api/v1/tenders/${tid}/submit`).set(as('admin')).expect(201);
+      const d = await request(http).post(`/api/v1/tenders/${tid}/decision`).set(as('admin')).send({ decision: 'WON' }).expect(201);
+      projectId = d.body.data.projectId;
+      const r = (await request(http).get(`/api/v1/projects/${projectId}/rap`).set(as('admin')).expect(200)).body.data;
+      expect(r.locked).toBe(false);
+      expect(r.rab).toHaveLength(2);
+      const linked = r.budget.items.filter((i: any) => i.bqItemId);
+      expect(linked).toHaveLength(2);
+      expect(linked[1]).toMatchObject({ section: 'II. Struktur', code: 'II.1', description: 'Beton K-300', bqItemId: r.rab[1].id });
+      expect(Number(linked[1].unitRate)).toBe(1200000.5);
+      expect(r.budget.items.find((i: any) => i.description === 'Overhead proyek')).toBeTruthy();
+    });
+    it('RAP bisa diubah (harga, baris tambahan) lalu ditetapkan; setelah itu terkunci', async () => {
+      const r = (await request(http).get(`/api/v1/projects/${projectId}/rap`).set(as('admin'))).body.data;
+      const items = r.rab.map((b: any) => ({ bqItemId: b.id, section: b.section, code: b.code, description: b.description, unit: b.unit, category: b.category, quantity: String(b.quantity), unitRate: b.code === 'II.1' ? '1100000' : '4500000' }));
+      items.push({ section: 'Biaya tidak langsung', code: 'BTL.1', description: 'Gaji staf lapangan', unit: 'bln', category: 'OVERHEAD', quantity: '3', unitRate: '8000000' });
+      const s = (await request(http).put(`/api/v1/projects/${projectId}/rap`).set(as('admin')).send({ items }).expect(200)).body.data;
+      expect(Number(s.totals.rap)).toBe(4500000 + 10.5 * 1100000 + 24000000);
+      expect(s.totals.bkpuPct).toBeGreaterThan(0);
+      await request(http).put(`/api/v1/projects/${projectId}/rap`).set(as('admin')).send({ items: [{ ...items[0], bqItemId: '00000000-0000-0000-0000-000000000000' }] }).expect(422);
+      const a = (await request(http).post(`/api/v1/projects/${projectId}/rap/approve`).set(as('admin')).expect(201)).body.data;
+      expect(a.locked).toBe(true);
+      // BK/PU penetapan otomatis = total RAP ÷ total RAB saat RAP ditetapkan
+      const pd = (await request(http).get(`/api/v1/projects/${projectId}`).set(as('admin'))).body.data;
+      expect(Number(pd.bkpuPenetapanPct)).toBe(s.totals.bkpuPct);
+      expect(Number(pd.bkpuPenetapanPct)).toBeCloseTo((Number(s.totals.rap) / Number(s.totals.rab)) * 100, 2);
+      // tidak bisa diisi manual
+      await request(http).patch(`/api/v1/projects/${projectId}`).set(as('admin')).send({ bkpuPenetapanPct: '50' }).expect(400);
+      const again = await request(http).put(`/api/v1/projects/${projectId}/rap`).set(as('admin')).send({ items }).expect(422);
+      expect(again.body.error.code).toBe('RAP_LOCKED');
+      // Cost control memakai RAP yang ditetapkan
+      const cost = (await request(http).get(`/api/v1/projects/${projectId}`).set(as('admin'))).body.data.cost;
+      expect(Number(cost.total.budget)).toBe(4500000 + 10.5 * 1100000 + 24000000);
+    });
+    it('proyek manual: RAP kosong bisa diisi tanpa acuan RAB; RAP kosong tidak bisa ditetapkan', async () => {
+      const p = await request(http).post('/api/v1/projects').set(as('admin')).send({ name: 'Proyek manual RAP', contractValue: '500000000' }).expect(201);
+      await request(http).post(`/api/v1/projects/${p.body.data.id}/rap/approve`).set(as('admin')).expect(422);
+      await request(http).put(`/api/v1/projects/${p.body.data.id}/rap`).set(as('admin')).send({ items: [{ section: 'A', code: 'A.1', description: 'Pekerjaan tanah', unit: 'm3', category: 'LABOR', quantity: '100', unitRate: '75000' }] }).expect(200);
+      await request(http).put(`/api/v1/projects/${p.body.data.id}/rap`).set(as('fin')).send({ items: [] }).expect(403);
     });
   });
 });

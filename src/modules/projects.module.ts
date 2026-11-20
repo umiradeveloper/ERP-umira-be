@@ -1,10 +1,11 @@
-import { Body, Controller, Get, Injectable, Module, Param, Patch, Post } from '@nestjs/common';
+import { Body, Controller, Get, Injectable, Module, Param, Patch, Post, Put } from '@nestjs/common';
+import { Type } from 'class-transformer';
 import { ApiTags } from '@nestjs/swagger';
-import { IsDateString, IsIn, IsInt, IsNumberString, IsOptional, IsString, MaxLength, Min, ValidateIf } from 'class-validator';
+import { IsDateString, IsIn, IsInt, IsNumberString, IsOptional, IsString, MaxLength, Min, ValidateIf, ValidateNested } from 'class-validator';
 import { CostCategory, Prisma, ProjectStatus } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuthUser, CurrentUser, Perm } from '../common/auth';
-import { AuditService, D, notFound, SequenceService, ZERO } from '../common/common.service';
+import { AuditService, D, notFound, round2, SequenceService, sumD, ZERO } from '../common/common.service';
 import { BusinessError } from '../common/http';
 
 const CATEGORIES: CostCategory[] = ['MATERIAL', 'LABOR', 'EQUIPMENT', 'SUBCONTRACTOR', 'OVERHEAD', 'OTHER'];
@@ -19,7 +20,6 @@ class ProjectDto {
   @IsOptional() @IsNumberString() retentionPct?: string;
   @IsOptional() @IsDateString() startDate?: string;
   @IsOptional() @IsDateString() endDate?: string;
-  @IsOptional() @IsNumberString() bkpuPenetapanPct?: string;
 }
 class ProjectPatchDto {
   @IsOptional() @IsIn(['SETUP', 'ACTIVE', 'ON_HOLD', 'COMPLETION', 'CLOSED', 'CANCELLED']) status?: ProjectStatus;
@@ -27,12 +27,23 @@ class ProjectPatchDto {
   @IsOptional() @IsString() location?: string;
   @IsOptional() @IsDateString() startDate?: string;
   @IsOptional() @IsDateString() endDate?: string;
-  /** BK/PU penetapan (%); kirim "" untuk mengosongkan */
-  @IsOptional() @ValidateIf((o) => o.bkpuPenetapanPct !== '') @IsNumberString() bkpuPenetapanPct?: string;
   /** id file foto proyek; kirim "" untuk menghapus */
   @IsOptional() @IsString() coverFileId?: string;
   /** Judul foto proyek; kirim "" untuk menghapus */
   @IsOptional() @IsString() @MaxLength(190) coverTitle?: string;
+}
+class RapItemDto {
+  @IsOptional() @IsString() bqItemId?: string;
+  @IsOptional() @IsString() @MaxLength(500) section?: string;
+  @IsOptional() @IsString() @MaxLength(100) code?: string;
+  @IsString() description!: string;
+  @IsOptional() @IsString() unit?: string;
+  @IsIn(['MATERIAL', 'LABOR', 'EQUIPMENT', 'SUBCONTRACTOR', 'OVERHEAD', 'OTHER']) category!: CostCategory;
+  @IsNumberString() quantity!: string;
+  @IsNumberString() unitRate!: string;
+}
+class RapDto {
+  @ValidateNested({ each: true }) @Type(() => RapItemDto) items!: RapItemDto[];
 }
 class ProgressDto {
   @IsDateString() reportDate!: string;
@@ -182,7 +193,7 @@ export class ProjectsService {
    * - Awal: budget pertama (RAP revisi terendah) ÷ nilai kontrak awal (kontrak sekarang − VO yang disetujui).
    * - Saat ini: biaya aktual tercatat ÷ pendapatan usaha sesuai progres fisik (progres % × nilai kontrak sekarang).
    */
-  async bkpu(tenantId: string, projects: { id: string; contractValue: Prisma.Decimal; progressPct: Prisma.Decimal | number }[]) {
+  async bkpu(tenantId: string, projects: { id: string; contractValue: Prisma.Decimal; progressPct: Prisma.Decimal | number; bkpuPenetapanPct?: Prisma.Decimal | null }[]) {
     const ids = projects.map((p) => p.id);
     const [budgets, vos, actual] = await Promise.all([
       this.prisma.budget.findMany({
@@ -212,18 +223,17 @@ export class ProjectsService {
         return [p.id, {
           bkAwal, puAwal, bkpuAwalPct: awal,
           bkSaatIni: bkNow, puSaatIni: puNow, bkpuSaatIniPct: now,
-          // Efisiensi (poin %) = BK/PU awal − BK/PU saat ini; positif = lebih hemat dari rencana awal
-          efisiensiPct: awal !== null && now !== null ? Math.round((awal - now) * 100) / 100 : null,
+          // Efisiensi (poin %) = BK/PU penetapan (dari RAP yang ditetapkan) − BK/PU saat ini; positif = lebih hemat.
+          // Proyek lama tanpa penetapan memakai BK/PU awal yang dihitung.
+          efisiensiPct: (() => {
+            const base = p.bkpuPenetapanPct !== null && p.bkpuPenetapanPct !== undefined ? Number(p.bkpuPenetapanPct) : awal;
+            return base !== null && now !== null ? Math.round((base - now) * 100) / 100 : null;
+          })(),
         }] as const;
       }),
     );
   }
 
-  private pctValue(v: string) {
-    const n = D(v);
-    if (n.lt(0) || n.gt(999)) throw new BusinessError('BK/PU penetapan harus antara 0 dan 999%');
-    return n.toDecimalPlaces(2);
-  }
 
   async get(u: AuthUser, id: string) {
     const p = notFound(
@@ -241,11 +251,13 @@ export class ProjectsService {
     const buckets = await this.cost.buckets(u.tenantId, [id]);
     const cost = this.cost.summarize(buckets.get(id));
     const bkpu = (await this.bkpu(u.tenantId, [p])).get(p.id)!;
+    const rapBudget = await this.prisma.budget.findFirst({ where: { tenantId: u.tenantId, projectId: p.id, isBaseline: true }, orderBy: { revision: 'desc' }, select: { approvedAt: true, _count: { select: { items: true } } } });
     const billedGross = invoices.filter((i) => !['DRAFT', 'CANCELLED'].includes(i.status)).reduce((a, i) => a.plus(i.grossAmount), ZERO);
     const received = invoices.reduce((a, i) => a.plus(i.paidAmount), ZERO);
     return {
       ...p,
       ...bkpu,
+      rap: { approvedAt: rapBudget?.approvedAt ?? null, items: rapBudget?._count.items ?? 0 },
       progress,
       dailyReports,
       cost,
@@ -272,6 +284,79 @@ export class ProjectsService {
     });
   }
 
+  /** RAP (Rencana Anggaran Pelaksanaan) disusun seperti RAB dengan RAB sebagai acuan */
+  async rap(u: AuthUser, id: string) {
+    const p = notFound(await this.prisma.project.findFirst({ where: { id, tenantId: u.tenantId } }), 'Proyek');
+    const [budget, rab] = await Promise.all([
+      this.prisma.budget.findFirst({ where: { tenantId: u.tenantId, projectId: id, isBaseline: true }, orderBy: { revision: 'desc' }, include: { items: { orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }] } } }),
+      this.prisma.bqItem.findMany({ where: { tenantId: u.tenantId, projectId: id }, orderBy: { sortOrder: 'asc' } }),
+    ]);
+    const totalRab = sumD(rab.map((r) => r.amount));
+    const totalRap = sumD((budget?.items ?? []).map((i) => i.amount));
+    return {
+      budget,
+      rab,
+      locked: !!budget?.approvedAt,
+      totals: {
+        rab: totalRab, rap: totalRap, selisih: totalRab.minus(totalRap),
+        bkpuPct: totalRab.gt(0) && totalRap.gt(0) ? totalRap.div(totalRab).mul(100).toDecimalPlaces(2).toNumber() : null,
+        contractValue: p.contractValue,
+      },
+    };
+  }
+
+  private async draftRap(u: AuthUser, id: string) {
+    notFound(await this.prisma.project.findFirst({ where: { id, tenantId: u.tenantId } }), 'Proyek');
+    let b = await this.prisma.budget.findFirst({ where: { tenantId: u.tenantId, projectId: id, isBaseline: true }, orderBy: { revision: 'desc' } });
+    if (!b) b = await this.prisma.budget.create({ data: { tenantId: u.tenantId, projectId: id, name: 'RAP', isBaseline: true } });
+    if (b.approvedAt) throw new BusinessError('RAP sudah ditetapkan. Perubahan setelah penetapan dilakukan lewat Variation order.', 'RAP_LOCKED');
+    return b;
+  }
+
+  async saveRap(u: AuthUser, id: string, dto: RapDto) {
+    const b = await this.draftRap(u, id);
+    const rabIds = new Set((await this.prisma.bqItem.findMany({ where: { tenantId: u.tenantId, projectId: id }, select: { id: true } })).map((r) => r.id));
+    const items = dto.items.map((i, k) => {
+      if (i.bqItemId && !rabIds.has(i.bqItemId)) throw new BusinessError(`Baris ${k + 1}: acuan RAB tidak ditemukan`);
+      if (!i.description.trim()) throw new BusinessError(`Baris ${k + 1}: uraian wajib diisi`);
+      const quantity = D(i.quantity);
+      const unitRate = D(i.unitRate);
+      if (quantity.lt(0) || unitRate.lt(0)) throw new BusinessError(`Baris ${k + 1}: volume dan harga satuan tidak boleh negatif`);
+      return {
+        tenantId: u.tenantId, budgetId: b.id, bqItemId: i.bqItemId || null, sortOrder: k, section: i.section?.trim() || null, code: i.code?.trim() || null,
+        wbsCode: i.section?.trim() || null, category: i.category, description: i.description.trim(), unit: i.unit?.trim() || null,
+        quantity: quantity.toDecimalPlaces(6), unitRate: unitRate.toDecimalPlaces(6), amount: round2(quantity.mul(unitRate)),
+      };
+    });
+    await this.prisma.$transaction([
+      this.prisma.budgetItem.deleteMany({ where: { budgetId: b.id } }),
+      this.prisma.budgetItem.createMany({ data: items }),
+    ]);
+    await this.audit.log(u, 'UPDATE_RAP', 'Project', id, { items: items.length, total: sumD(items.map((i) => i.amount)).toString() });
+    return this.rap(u, id);
+  }
+
+  async approveRap(u: AuthUser, id: string) {
+    const b = await this.draftRap(u, id);
+    const count = await this.prisma.budgetItem.count({ where: { budgetId: b.id } });
+    if (!count) throw new BusinessError('RAP masih kosong. Isi dan simpan RAP terlebih dahulu.');
+    // BK/PU penetapan = BK/PU awal saat RAP ditetapkan: total RAP ÷ total RAB (tanpa RAB: ÷ nilai kontrak)
+    const p = notFound(await this.prisma.project.findFirst({ where: { id, tenantId: u.tenantId } }), 'Proyek');
+    const [rap, rab] = await Promise.all([
+      this.prisma.budgetItem.aggregate({ where: { budgetId: b.id }, _sum: { amount: true } }),
+      this.prisma.bqItem.aggregate({ where: { tenantId: u.tenantId, projectId: id }, _sum: { amount: true } }),
+    ]);
+    const pu = D(rab._sum.amount).gt(0) ? D(rab._sum.amount) : p.contractValue;
+    const bkpu = pu.gt(0) ? D(rap._sum.amount).div(pu).mul(100).toDecimalPlaces(2) : null;
+    if (bkpu && bkpu.gt(99999)) throw new BusinessError('BK/PU RAP tidak wajar. Periksa nilai RAP dan RAB.');
+    await this.prisma.$transaction([
+      this.prisma.budget.update({ where: { id: b.id }, data: { approvedAt: new Date() } }),
+      this.prisma.project.update({ where: { id }, data: { bkpuPenetapanPct: bkpu } }),
+    ]);
+    await this.audit.log(u, 'APPROVE_RAP', 'Project', id, { budgetId: b.id, bkpuPenetapanPct: bkpu?.toString() ?? null });
+    return this.rap(u, id);
+  }
+
   async costs(u: AuthUser, id: string) {
     notFound(await this.prisma.project.findFirst({ where: { id, tenantId: u.tenantId } }), 'Proyek');
     return this.prisma.projectCost.findMany({ where: { tenantId: u.tenantId, projectId: id }, orderBy: { costDate: 'desc' } });
@@ -285,15 +370,15 @@ export class ProjectsService {
         const c = notFound(await tx.customer.findFirst({ where: { id: dto.customerId, tenantId: u.tenantId } }), 'Customer');
         ownerName = c.name;
       }
+      const code = await this.seq.next(tx, u.tenantId, 'PRJ');
       const p = await tx.project.create({
         data: {
           tenantId: u.tenantId, companyId: company.id, customerId: dto.customerId || null, ownerName,
-          code: await this.seq.next(tx, u.tenantId, 'PRJ'), name: dto.name, location: dto.location,
+          code, name: dto.name, location: dto.location,
           managerName: dto.managerName, contractValue: D(dto.contractValue),
           retentionPct: dto.retentionPct ? D(dto.retentionPct) : undefined,
           startDate: dto.startDate ? new Date(dto.startDate) : null, endDate: dto.endDate ? new Date(dto.endDate) : null,
-          bkpuPenetapanPct: dto.bkpuPenetapanPct ? this.pctValue(dto.bkpuPenetapanPct) : null,
-          budgets: { create: { tenantId: u.tenantId, name: 'Baseline', isBaseline: true } },
+          budgets: { create: { tenantId: u.tenantId, name: `RAP ${code}`, isBaseline: true } },
         },
       });
       await this.audit.log(u, 'CREATE', 'Project', p.id, { code: p.code }, tx);
@@ -320,7 +405,6 @@ export class ProjectsService {
       data: {
         status: dto.status, managerName: dto.managerName, location: dto.location,
         startDate: dto.startDate ? new Date(dto.startDate) : undefined, endDate: dto.endDate ? new Date(dto.endDate) : undefined,
-        bkpuPenetapanPct: dto.bkpuPenetapanPct === undefined ? undefined : dto.bkpuPenetapanPct === '' ? null : this.pctValue(dto.bkpuPenetapanPct),
         coverFileId,
         coverTitle: dto.coverTitle === undefined ? (coverFileId === null ? null : undefined) : dto.coverTitle.trim() || null,
       },
@@ -374,6 +458,12 @@ export class ProjectsController {
   update(@CurrentUser() u: AuthUser, @Param('id') id: string, @Body() dto: ProjectPatchDto) { return this.svc.update(u, id, dto); }
   @Get('projects/:id/bq/items') @Perm('project:read', 'tender:read')
   bq(@CurrentUser() u: AuthUser, @Param('id') id: string) { return this.svc.bq(u, id); }
+  @Get('projects/:id/rap') @Perm('project:read', 'cost:read')
+  rap(@CurrentUser() u: AuthUser, @Param('id') id: string) { return this.svc.rap(u, id); }
+  @Put('projects/:id/rap') @Perm('project:write')
+  saveRap(@CurrentUser() u: AuthUser, @Param('id') id: string, @Body() dto: RapDto) { return this.svc.saveRap(u, id, dto); }
+  @Post('projects/:id/rap/approve') @Perm('project:write')
+  approveRap(@CurrentUser() u: AuthUser, @Param('id') id: string) { return this.svc.approveRap(u, id); }
   @Get('projects/:id/budget') @Perm('project:read', 'cost:read')
   budget(@CurrentUser() u: AuthUser, @Param('id') id: string) { return this.svc.budget(u, id); }
   @Get('projects/:id/costs') @Perm('cost:read', 'project:read')
