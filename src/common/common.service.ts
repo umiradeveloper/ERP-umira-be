@@ -6,7 +6,8 @@ import { NotifyService } from './notify.service';
 
 export const D = (v: Prisma.Decimal.Value | null | undefined) => new Prisma.Decimal(v ?? 0);
 export const ZERO = new Prisma.Decimal(0);
-export const round2 = (v: Prisma.Decimal) => v.toDecimalPlaces(2, Prisma.Decimal.ROUND_HALF_UP);
+// export const round2 = (v: Prisma.Decimal) => v.toDecimalPlaces(2, Prisma.Decimal.ROUND_HALF_UP);
+export const round2 = (v: Prisma.Decimal) => v.toDecimalPlaces(2, Prisma.Decimal);
 export const sumD = (vals: Prisma.Decimal.Value[]) => vals.reduce<Prisma.Decimal>((a, b) => a.plus(D(b)), ZERO);
 
 export function notFound<T>(v: T | null | undefined, what = 'Data'): T {
