@@ -302,8 +302,8 @@ model TenderItem {
   unit        String?
   category    CostCategory @default(MATERIAL)
   costCode    String?
-  quantity    Decimal      @default(0) @db.Decimal(18, 4)
-  unitCost    Decimal      @default(0) @db.Decimal(18, 2)
+  quantity    Decimal      @default(0) @db.Decimal(20, 6)
+  unitCost    Decimal      @default(0) @db.Decimal(20, 6)
   amount      Decimal      @default(0) @db.Decimal(18, 2)
 
   tender Tender @relation(fields: [tenderId], references: [id], onDelete: Cascade)
@@ -371,8 +371,8 @@ model BqItem {
   unit        String?
   category    CostCategory @default(MATERIAL)
   costCode    String?
-  quantity    Decimal      @default(0) @db.Decimal(18, 4)
-  unitPrice   Decimal      @default(0) @db.Decimal(18, 2)
+  quantity    Decimal      @default(0) @db.Decimal(20, 6)
+  unitPrice   Decimal      @default(0) @db.Decimal(20, 6)
   amount      Decimal      @default(0) @db.Decimal(18, 2)
   revision    Int          @default(1)
 
@@ -440,9 +440,9 @@ model BudgetItem {
   costCode    String?
   category    CostCategory
   description String
-  quantity    Decimal      @default(0) @db.Decimal(18, 4)
+  quantity    Decimal      @default(0) @db.Decimal(20, 6)
   unit        String?
-  unitRate    Decimal      @default(0) @db.Decimal(18, 2)
+  unitRate    Decimal      @default(0) @db.Decimal(20, 6)
   amount      Decimal      @default(0) @db.Decimal(18, 2)
 
   budget Budget @relation(fields: [budgetId], references: [id])

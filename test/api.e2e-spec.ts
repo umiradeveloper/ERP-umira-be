@@ -476,4 +476,21 @@ describe('Contractor ERP API (e2e)', () => {
       await request(http).patch(`/api/v1/projects/${pid}`).set(as('admin')).send({ coverFileId: '00000000-0000-0000-0000-000000000000' }).expect(404);
     });
   });
+
+  describe('Presisi BQ sama dengan Excel', () => {
+    it('volume & harga satuan bergelombang desimal disimpan utuh; jumlah = volume × harga (dibulatkan ke sen)', async () => {
+      const t = await request(http).post('/api/v1/tenders').set(as('admin')).send({ title: 'Tender presisi' }).expect(201);
+      const items = [
+        { section: 'A', code: 'A.1', description: 'Beton K-300', unit: 'm3', category: 'MATERIAL', quantity: '12.345678', unitCost: '1152345.678912' },
+        { section: 'A', code: 'A.2', description: 'Besi', unit: 'kg', category: 'MATERIAL', quantity: '2500.5', unitCost: '14231.4567' },
+      ];
+      const r = await request(http).put(`/api/v1/tenders/${t.body.data.id}/items`).set(as('admin')).send({ items }).expect(200);
+      const got = r.body.data.items;
+      expect(Number(got[0].quantity)).toBe(12.345678);
+      expect(Number(got[0].unitCost)).toBe(1152345.678912);
+      // Excel: =12.345678*1152345.678912 = 14226472.24... → 14226472.24
+      expect(Number(got[0].amount)).toBe(Math.round(12.345678 * 1152345.678912 * 100) / 100);
+      expect(Number(got[1].amount)).toBe(Math.round(2500.5 * 14231.4567 * 100) / 100);
+    });
+  });
 });

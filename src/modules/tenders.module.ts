@@ -188,7 +188,7 @@ export class TendersService {
       const company = notFound(await tx.company.findFirst({ where: { tenantId: u.tenantId } }), 'Perusahaan');
 
       const bq = t.items.map((i) => {
-        const unitPrice = round2(i.unitCost.mul(factor));
+        const unitPrice = i.unitCost.mul(factor).toDecimalPlaces(6);
         return { i, unitPrice, amount: round2(unitPrice.mul(i.quantity)) };
       });
       const contractValue = sumD(bq.map((b) => b.amount));
