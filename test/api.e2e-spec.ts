@@ -465,10 +465,14 @@ describe('Contractor ERP API (e2e)', () => {
       const pdf = await request(http).post('/api/v1/files').set(as('admin')).field('entityType', 'Project').field('entityId', pid).attach('files', Buffer.from('%PDF-1.4'), { filename: 'a.pdf', contentType: 'application/pdf' }).expect(201);
       await request(http).patch(`/api/v1/projects/${pid}`).set(as('admin')).send({ coverFileId: pdf.body.data[0].id }).expect(422);
       const img = await request(http).post('/api/v1/files').set(as('admin')).field('entityType', 'Project').field('entityId', pid).attach('files', Buffer.from([0x89, 0x50, 0x4e, 0x47]), { filename: 'foto.png', contentType: 'image/png' }).expect(201);
-      await request(http).patch(`/api/v1/projects/${pid}`).set(as('admin')).send({ coverFileId: img.body.data[0].id }).expect(200);
-      expect((await request(http).get(`/api/v1/projects/${pid}`).set(as('admin'))).body.data.coverFileId).toBe(img.body.data[0].id);
+      await request(http).patch(`/api/v1/projects/${pid}`).set(as('admin')).send({ coverFileId: img.body.data[0].id, coverTitle: '  Tampak depan  ' }).expect(200);
+      let d = (await request(http).get(`/api/v1/projects/${pid}`).set(as('admin'))).body.data;
+      expect(d).toMatchObject({ coverFileId: img.body.data[0].id, coverTitle: 'Tampak depan' });
+      await request(http).patch(`/api/v1/projects/${pid}`).set(as('admin')).send({ coverTitle: 'Progres struktur lantai 3' }).expect(200);
+      d = (await request(http).get(`/api/v1/projects/${pid}`).set(as('admin'))).body.data;
+      expect(d).toMatchObject({ coverFileId: img.body.data[0].id, coverTitle: 'Progres struktur lantai 3' });
       await request(http).delete(`/api/v1/files/${img.body.data[0].id}`).set(as('admin')).expect(200);
-      expect((await request(http).get(`/api/v1/projects/${pid}`).set(as('admin'))).body.data.coverFileId).toBeNull();
+      expect((await request(http).get(`/api/v1/projects/${pid}`).set(as('admin'))).body.data).toMatchObject({ coverFileId: null, coverTitle: null });
       await request(http).patch(`/api/v1/projects/${pid}`).set(as('admin')).send({ coverFileId: '00000000-0000-0000-0000-000000000000' }).expect(404);
     });
   });

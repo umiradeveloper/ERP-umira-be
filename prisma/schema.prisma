@@ -336,6 +336,8 @@ model Project {
   bkpuPenetapanPct Decimal?   @db.Decimal(7, 2)
   /// Foto proyek (FileObject kategori "cover")
   coverFileId   String?       @db.Char(36)
+  /// Judul / keterangan foto proyek
+  coverTitle    String?       @db.VarChar(190)
   status        ProjectStatus @default(SETUP)
   createdAt     DateTime      @default(now())
   updatedAt     DateTime      @updatedAt

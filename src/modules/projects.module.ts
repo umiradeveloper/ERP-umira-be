@@ -1,6 +1,6 @@
 import { Body, Controller, Get, Injectable, Module, Param, Patch, Post } from '@nestjs/common';
 import { ApiTags } from '@nestjs/swagger';
-import { IsDateString, IsIn, IsInt, IsNumberString, IsOptional, IsString, Min, ValidateIf } from 'class-validator';
+import { IsDateString, IsIn, IsInt, IsNumberString, IsOptional, IsString, MaxLength, Min, ValidateIf } from 'class-validator';
 import { CostCategory, Prisma, ProjectStatus } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuthUser, CurrentUser, Perm } from '../common/auth';
@@ -31,6 +31,8 @@ class ProjectPatchDto {
   @IsOptional() @ValidateIf((o) => o.bkpuPenetapanPct !== '') @IsNumberString() bkpuPenetapanPct?: string;
   /** id file foto proyek; kirim "" untuk menghapus */
   @IsOptional() @IsString() coverFileId?: string;
+  /** Judul foto proyek; kirim "" untuk menghapus */
+  @IsOptional() @IsString() @MaxLength(190) coverTitle?: string;
 }
 class ProgressDto {
   @IsDateString() reportDate!: string;
@@ -320,6 +322,7 @@ export class ProjectsService {
         startDate: dto.startDate ? new Date(dto.startDate) : undefined, endDate: dto.endDate ? new Date(dto.endDate) : undefined,
         bkpuPenetapanPct: dto.bkpuPenetapanPct === undefined ? undefined : dto.bkpuPenetapanPct === '' ? null : this.pctValue(dto.bkpuPenetapanPct),
         coverFileId,
+        coverTitle: dto.coverTitle === undefined ? (coverFileId === null ? null : undefined) : dto.coverTitle.trim() || null,
       },
     });
     await this.audit.log(u, dto.status && dto.status !== p.status ? `STATUS_${dto.status}` : 'UPDATE', 'Project', id, { before: { status: p.status }, after: dto });
