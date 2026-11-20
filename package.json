@@ -18,7 +18,8 @@
     "tenant:create": "ts-node prisma/create-tenant.ts",
     "tenant:disable": "ts-node prisma/tenant-status.ts --disable",
     "tenant:enable": "ts-node prisma/tenant-status.ts --enable",
-    "tenant:delete": "ts-node prisma/tenant-delete.ts"
+    "tenant:delete": "ts-node prisma/tenant-delete.ts",
+    "reset:data": "ts-node prisma/reset-data.ts"
   },
   "prisma": {
     "seed": "ts-node prisma/seed.ts"
