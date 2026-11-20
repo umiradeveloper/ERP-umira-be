@@ -153,6 +153,7 @@ export class ProjectsService {
       _sum: { grossAmount: true },
     });
     const billedMap = new Map(billed.map((b) => [b.projectId, D(b._sum.grossAmount)]));
+    const bkpu = await this.bkpu(u.tenantId, projects);
     return projects.map((p) => {
       const { total } = this.cost.summarize(buckets.get(p.id));
       // Tanpa budget baseline, forecast margin belum bisa dihitung
@@ -164,8 +165,47 @@ export class ProjectsService {
         billed: billedMap.get(p.id) ?? ZERO,
         forecastMargin: margin,
         forecastMarginPct: margin && p.contractValue.gt(0) ? margin.div(p.contractValue).mul(100).toNumber() : null,
+        ...bkpu.get(p.id)!,
       };
     });
+  }
+
+  /**
+   * BK/PU = Biaya Konstruksi / Pendapatan Usaha.
+   * - Awal: budget pertama (RAP revisi terendah) ÷ nilai kontrak awal (kontrak sekarang − VO yang disetujui).
+   * - Saat ini: biaya aktual tercatat ÷ pendapatan usaha sesuai progres fisik (progres % × nilai kontrak sekarang).
+   */
+  async bkpu(tenantId: string, projects: { id: string; contractValue: Prisma.Decimal; progressPct: Prisma.Decimal | number }[]) {
+    const ids = projects.map((p) => p.id);
+    const [budgets, vos, actual] = await Promise.all([
+      this.prisma.budget.findMany({
+        where: { tenantId, projectId: { in: ids } },
+        orderBy: [{ revision: 'asc' }, { createdAt: 'asc' }],
+        include: { items: { select: { amount: true } } },
+      }),
+      this.prisma.variationOrder.groupBy({ by: ['projectId'], where: { tenantId, projectId: { in: ids }, status: 'APPROVED' }, _sum: { contractChange: true } }),
+      this.prisma.projectCost.groupBy({ by: ['projectId'], where: { tenantId, projectId: { in: ids } }, _sum: { amount: true } }),
+    ]);
+    const firstBudget = new Map<string, Prisma.Decimal>();
+    for (const b of budgets) {
+      if (firstBudget.has(b.projectId)) continue;
+      firstBudget.set(b.projectId, b.items.reduce((a, i) => a.plus(i.amount), ZERO));
+    }
+    const voMap = new Map(vos.map((v) => [v.projectId, D(v._sum.contractChange)]));
+    const actMap = new Map(actual.map((a) => [a.projectId, D(a._sum.amount)]));
+    const ratio = (a: Prisma.Decimal, b: Prisma.Decimal) => (b.gt(0) && a.gt(0) ? a.div(b).mul(100).toDecimalPlaces(2).toNumber() : null);
+    return new Map(
+      projects.map((p) => {
+        const puAwal = p.contractValue.minus(voMap.get(p.id) ?? ZERO);
+        const bkAwal = firstBudget.get(p.id) ?? ZERO;
+        const puNow = p.contractValue.mul(D(p.progressPct)).div(100).toDecimalPlaces(2);
+        const bkNow = actMap.get(p.id) ?? ZERO;
+        return [p.id, {
+          bkAwal, puAwal, bkpuAwalPct: ratio(bkAwal, puAwal),
+          bkSaatIni: bkNow, puSaatIni: puNow, bkpuSaatIniPct: ratio(bkNow, puNow),
+        }] as const;
+      }),
+    );
   }
 
   async get(u: AuthUser, id: string) {
