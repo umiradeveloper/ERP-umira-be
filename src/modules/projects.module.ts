@@ -1,4 +1,6 @@
-import { Body, Controller, Get, Injectable, Module, Param, Patch, Post, Put } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Injectable, Module, Param, Patch, Post, Put, Query } from '@nestjs/common';
+import { unlinkSync } from 'fs';
+import { resolve } from 'path';
 import { Type } from 'class-transformer';
 import { ApiTags } from '@nestjs/swagger';
 import { IsDateString, IsIn, IsInt, IsNumberString, IsOptional, IsString, MaxLength, Min, ValidateIf, ValidateNested } from 'class-validator';
@@ -357,6 +359,125 @@ export class ProjectsService {
     return this.rap(u, id);
   }
 
+  /**
+   * Cek sebelum hapus proyek: apa saja yang ikut terhapus dan apa yang menghalangi.
+   * Proyek yang sudah punya transaksi keuangan/stok (PO, invoice, jurnal, mutasi stok) tidak bisa dihapus —
+   * ubah statusnya menjadi Dibatalkan supaya riwayat akuntansi tetap utuh.
+   */
+  async deleteCheck(u: AuthUser, id: string) {
+    const p = notFound(await this.prisma.project.findFirst({ where: { id, tenantId: u.tenantId }, select: { id: true, code: true, name: true } }), 'Proyek');
+    const w = { tenantId: u.tenantId, projectId: id };
+    const [po, sinv, cinv, journal, stock, bq, rap, progress, reports, vo, pr, rfq, files, tender] = await Promise.all([
+      this.prisma.purchaseOrder.count({ where: w }),
+      this.prisma.supplierInvoice.count({ where: w }),
+      this.prisma.customerInvoice.count({ where: w }),
+      this.prisma.journalLine.count({ where: w }),
+      this.prisma.stockMovement.count({ where: w }),
+      this.prisma.bqItem.count({ where: w }),
+      this.prisma.budgetItem.count({ where: { tenantId: u.tenantId, budget: { projectId: id } } }),
+      this.prisma.progressEntry.count({ where: w }),
+      this.prisma.dailyReport.count({ where: w }),
+      this.prisma.variationOrder.count({ where: w }),
+      this.prisma.purchaseRequest.count({ where: w }),
+      this.prisma.rfq.count({ where: w }),
+      this.prisma.fileObject.count({ where: { tenantId: u.tenantId, entityType: 'Project', entityId: id } }),
+      this.prisma.tender.findFirst({ where: { tenantId: u.tenantId, projectId: id }, select: { number: true } }),
+    ]);
+    const blockers = [
+      po && `${po} purchase order`, sinv && `${sinv} invoice supplier`, cinv && `${cinv} invoice pelanggan`,
+      journal && `${journal} baris jurnal`, stock && `${stock} mutasi stok`,
+    ].filter(Boolean) as string[];
+    return {
+      project: p,
+      canDelete: blockers.length === 0,
+      blockers,
+      willDelete: { rab: bq, rap, progress, dailyReports: reports, variationOrders: vo, purchaseRequests: pr, rfqs: rfq, files },
+      tender: tender?.number ?? null,
+    };
+  }
+
+  async remove(u: AuthUser, id: string, confirm?: string) {
+    const c = await this.deleteCheck(u, id);
+    if (!c.canDelete) {
+      throw new BusinessError(
+        `Proyek ${c.project.code} tidak bisa dihapus karena sudah punya ${c.blockers.join(', ')}. Ubah status proyek menjadi Dibatalkan.`,
+        'PROJECT_HAS_TRANSACTIONS',
+      );
+    }
+    if ((confirm ?? '').trim().toUpperCase() !== c.project.code.toUpperCase()) {
+      throw new BusinessError(`Ketik kode proyek ${c.project.code} untuk konfirmasi penghapusan.`, 'CONFIRM_REQUIRED');
+    }
+    const t = u.tenantId;
+    const w = { tenantId: t, projectId: id };
+    const keys: string[] = [];
+    await this.prisma.$transaction(async (tx) => {
+      const ids = async (rows: Promise<{ id: string }[]>) => (await rows).map((r) => r.id);
+      const prIds = await ids(tx.purchaseRequest.findMany({ where: w, select: { id: true } }));
+      const voIds = await ids(tx.variationOrder.findMany({ where: w, select: { id: true } }));
+      const rfqIds = await ids(tx.rfq.findMany({ where: w, select: { id: true } }));
+      const reportIds = await ids(tx.dailyReport.findMany({ where: w, select: { id: true } }));
+
+      // Approval PR & VO proyek ini
+      const apprIds = await ids(tx.approvalRequest.findMany({
+        where: { tenantId: t, OR: [{ entityType: 'PR', entityId: { in: prIds } }, { entityType: 'VO', entityId: { in: voIds } }] }, select: { id: true },
+      }));
+      await tx.approvalDecision.deleteMany({ where: { tenantId: t, approvalId: { in: apprIds } } });
+      await tx.approvalRequest.deleteMany({ where: { tenantId: t, id: { in: apprIds } } });
+
+      // RFQ → penawaran
+      const quoteIds = await ids(tx.supplierQuotation.findMany({ where: { tenantId: t, rfqId: { in: rfqIds } }, select: { id: true } }));
+      await tx.quotationLine.deleteMany({ where: { tenantId: t, quotationId: { in: quoteIds } } });
+      await tx.supplierQuotation.deleteMany({ where: { tenantId: t, id: { in: quoteIds } } });
+      await tx.rfqSupplier.deleteMany({ where: { tenantId: t, rfqId: { in: rfqIds } } });
+      await tx.rfqItem.deleteMany({ where: { tenantId: t, rfqId: { in: rfqIds } } });
+      await tx.rfq.deleteMany({ where: { tenantId: t, id: { in: rfqIds } } });
+
+      await tx.purchaseRequestItem.deleteMany({ where: { tenantId: t, requestId: { in: prIds } } });
+      await tx.purchaseRequest.deleteMany({ where: { tenantId: t, id: { in: prIds } } });
+      await tx.variationOrderItem.deleteMany({ where: { tenantId: t, voId: { in: voIds } } });
+      await tx.variationOrder.deleteMany({ where: { tenantId: t, id: { in: voIds } } });
+      await tx.projectCost.deleteMany({ where: w });
+      await tx.budgetItem.deleteMany({ where: { tenantId: t, budget: { projectId: id } } });
+      await tx.budget.deleteMany({ where: w });
+      await tx.bqItem.deleteMany({ where: w });
+      await tx.progressEntry.deleteMany({ where: w });
+      await tx.dailyReport.deleteMany({ where: w });
+
+      // File lampiran proyek, laporan harian, PR, VO, RFQ
+      const fileWhere = {
+        tenantId: t,
+        OR: [
+          { entityType: 'Project', entityId: id },
+          { entityType: 'DailyReport', entityId: { in: reportIds } },
+          { entityType: 'PurchaseRequest', entityId: { in: prIds } },
+          { entityType: 'VariationOrder', entityId: { in: voIds } },
+          { entityType: 'Rfq', entityId: { in: rfqIds } },
+        ],
+      };
+      keys.push(...(await tx.fileObject.findMany({ where: fileWhere, select: { storageKey: true } })).map((f) => f.storageKey));
+      await tx.fileObject.deleteMany({ where: fileWhere });
+
+      // Lepaskan keterkaitan: tender tetap ada (tercatat menang), aset & gudang tidak lagi terikat proyek,
+      // akses user yang khusus untuk proyek ini dicabut, notifikasi ke halaman proyek dihapus.
+      await tx.tender.updateMany({ where: w, data: { projectId: null } });
+      await tx.asset.updateMany({ where: w, data: { projectId: null } });
+      await tx.warehouse.updateMany({ where: w, data: { projectId: null } });
+      await tx.membership.deleteMany({ where: w });
+      await tx.notification.deleteMany({ where: { tenantId: t, link: { startsWith: `/projects/${id}` } } });
+
+      await tx.project.delete({ where: { id } });
+      await this.audit.log(u, 'DELETE', 'Project', id, { code: c.project.code, name: c.project.name, ...c.willDelete }, tx);
+    }, { timeout: 60_000 });
+
+    const root = resolve(process.env.UPLOAD_DIR ?? './uploads');
+    for (const k of keys) {
+      const f = resolve(root, k);
+      if (!f.startsWith(root)) continue;
+      try { unlinkSync(f); } catch { /* sudah tidak ada */ }
+    }
+    return { ok: true, code: c.project.code };
+  }
+
   async costs(u: AuthUser, id: string) {
     notFound(await this.prisma.project.findFirst({ where: { id, tenantId: u.tenantId } }), 'Proyek');
     return this.prisma.projectCost.findMany({ where: { tenantId: u.tenantId, projectId: id }, orderBy: { costDate: 'desc' } });
@@ -456,6 +577,10 @@ export class ProjectsController {
   get(@CurrentUser() u: AuthUser, @Param('id') id: string) { return this.svc.get(u, id); }
   @Patch('projects/:id') @Perm('project:write')
   update(@CurrentUser() u: AuthUser, @Param('id') id: string, @Body() dto: ProjectPatchDto) { return this.svc.update(u, id, dto); }
+  @Get('projects/:id/delete-check') @Perm('admin:write')
+  deleteCheck(@CurrentUser() u: AuthUser, @Param('id') id: string) { return this.svc.deleteCheck(u, id); }
+  @Delete('projects/:id') @Perm('admin:write')
+  remove(@CurrentUser() u: AuthUser, @Param('id') id: string, @Query('confirm') confirm?: string) { return this.svc.remove(u, id, confirm); }
   @Get('projects/:id/bq/items') @Perm('project:read', 'tender:read')
   bq(@CurrentUser() u: AuthUser, @Param('id') id: string) { return this.svc.bq(u, id); }
   @Get('projects/:id/rap') @Perm('project:read', 'cost:read')

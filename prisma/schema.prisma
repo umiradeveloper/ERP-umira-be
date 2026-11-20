@@ -176,6 +176,8 @@ model Role {
   description String?
   /// Array string permission, mis. ["project:read","procurement:write"]; "*" = semua
   permissions Json
+  /// Menu yang ditampilkan (daftar href, mis. ["/projects","/procurement/pr"]); null = semua menu sesuai permission
+  menus       Json?
 
   memberships Membership[]
 

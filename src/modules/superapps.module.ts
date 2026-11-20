@@ -1,4 +1,5 @@
-import { Controller, Get, Global, Injectable, Logger, Module, OnModuleDestroy, OnModuleInit, Post } from '@nestjs/common';
+import { Body, Controller, Get, Global, Injectable, Logger, Module, OnModuleDestroy, OnModuleInit, Post, Put } from '@nestjs/common';
+import { IsObject } from 'class-validator';
 import { ApiTags } from '@nestjs/swagger';
 import * as bcrypt from 'bcryptjs';
 import { existsSync, readFileSync } from 'fs';
@@ -45,6 +46,8 @@ export class SuperAppsService implements OnModuleInit, OnModuleDestroy {
   private log = new Logger('SuperApps');
   private pool?: Pool;
   private roleMap: Record<string, string[]> = {};
+  /** Pemetaan dari halaman admin (disimpan di Tenant.settings); bila ada, menggantikan file */
+  private dbMap: Record<string, string[]> | null = null;
   private timer?: NodeJS.Timeout;
   private lastSync?: any;
 
@@ -59,6 +62,7 @@ export class SuperAppsService implements OnModuleInit, OnModuleDestroy {
 
   onModuleInit() {
     this.loadRoleMap();
+    this.loadDbMap().catch((e) => this.log.warn(`Gagal memuat pemetaan role dari database: ${e.message}`));
     const every = Number(process.env.SUPERAPPS_SYNC_INTERVAL_MIN ?? 0);
     if (this.enabled && every > 0) {
       const run = () => this.syncAll(null).then((r) => this.log.log(`Sinkron user: ${r.created} baru, ${r.updated} diperbarui, ${r.deactivated} dinonaktifkan`)).catch((e) => this.log.warn(e.message));
@@ -87,6 +91,108 @@ export class SuperAppsService implements OnModuleInit, OnModuleDestroy {
   /** Dipakai untuk tes: ganti pemetaan role tanpa file */
   setRoleMap(map: Record<string, string[]>) {
     this.roleMap = Object.fromEntries(Object.entries(map).map(([k, v]) => [k.trim().toLowerCase(), v]));
+    this.dbMap = null;
+  }
+
+  private lower(map: Record<string, string[]>) {
+    return Object.fromEntries(Object.entries(map).map(([k, v]) => [k.trim().toLowerCase(), v]));
+  }
+  private get activeMap() {
+    return this.dbMap ?? this.roleMap;
+  }
+
+  private async connectedTenant() {
+    return this.tenantSlug ? this.prisma.tenant.findUnique({ where: { slug: this.tenantSlug } }) : null;
+  }
+  private storedMap(settings: unknown): Record<string, string[]> | null {
+    const m = (settings as any)?.superappsRoleMap;
+    return m && typeof m === 'object' && !Array.isArray(m) ? (m as Record<string, string[]>) : null;
+  }
+
+  async loadDbMap() {
+    const t = await this.connectedTenant();
+    const m = t ? this.storedMap(t.settings) : null;
+    this.dbMap = m ? this.lower(m) : null;
+  }
+
+  /** Pemetaan untuk halaman admin: role SuperApps (beserta jumlah user) → role ERP */
+  async getRoleMap(actor: AuthUser) {
+    const t = await this.connectedTenant();
+    const own = !!t && t.id === actor.tenantId;
+    const stored = own ? this.storedMap(t!.settings) : null;
+    let fileMap: Record<string, string[]> = {};
+    const file = resolve(process.env.SUPERAPPS_ROLE_MAP_FILE ?? 'superapps-role-map.json');
+    if (existsSync(file)) {
+      try {
+        fileMap = Object.fromEntries(Object.entries(JSON.parse(readFileSync(file, 'utf8'))).filter(([k, v]) => !k.startsWith('_') && Array.isArray(v))) as Record<string, string[]>;
+      } catch {
+        fileMap = {};
+      }
+    }
+    const map = stored ?? fileMap;
+    let saRoles: { name: string; users: number; approved: number }[] = [];
+    let saError: string | null = null;
+    if (this.enabled && own) {
+      try {
+        const [rows] = await (await this.db()).query<RowDataPacket[]>(
+          `SELECT r.nama_role AS name, COUNT(u.id_user) AS users, SUM(CASE WHEN u.isApproval = 1 THEN 1 ELSE 0 END) AS approved
+           FROM role r LEFT JOIN users u ON u.id_role = r.id_role GROUP BY r.id_role, r.nama_role ORDER BY r.nama_role`,
+        );
+        saRoles = rows.map((r) => ({ name: String(r.name ?? '').trim(), users: Number(r.users ?? 0), approved: Number(r.approved ?? 0) })).filter((r) => r.name);
+      } catch (e: any) {
+        saError = 'Database SuperApps tidak bisa dihubungi, daftar role diambil dari pemetaan yang tersimpan.';
+        this.log.warn(`Daftar role SuperApps gagal: ${e.message}`);
+      }
+    }
+    // gabungkan role yang ada di SuperApps dengan yang sudah ada di pemetaan
+    const names = new Map<string, { name: string; users: number | null; approved: number | null }>();
+    for (const r of saRoles) names.set(r.name.toLowerCase(), { name: r.name, users: r.users, approved: r.approved });
+    for (const k of Object.keys(map)) if (!names.has(k.trim().toLowerCase())) names.set(k.trim().toLowerCase(), { name: k.trim(), users: saRoles.length ? 0 : null, approved: saRoles.length ? 0 : null });
+    const lowerMap = this.lower(map);
+    return {
+      enabled: this.enabled && own,
+      source: stored ? 'database' : 'file',
+      saError,
+      roles: [...names.values()].sort((a, b) => a.name.localeCompare(b.name)).map((r) => ({ ...r, erpRoles: lowerMap[r.name.toLowerCase()] ?? [] })),
+    };
+  }
+
+  async saveRoleMap(actor: AuthUser, map: Record<string, string[]>) {
+    const t = await this.connectedTenant();
+    if (!t || t.id !== actor.tenantId) throw new BusinessError('Pemetaan SuperApps hanya untuk perusahaan yang terhubung ke SuperApps', 'SUPERAPPS_TENANT_MISMATCH');
+    const erp = new Set((await this.prisma.role.findMany({ where: { tenantId: t.id }, select: { name: true } })).map((r) => r.name));
+    const clean: Record<string, string[]> = {};
+    for (const [k, v] of Object.entries(map ?? {})) {
+      const key = k.trim();
+      if (!key || key.startsWith('_') || key.length > 120) continue;
+      if (!Array.isArray(v)) throw new BusinessError(`Pemetaan "${key}" tidak valid`);
+      const roles = [...new Set(v.map((x) => String(x).trim()).filter(Boolean))];
+      const unknown = roles.filter((r) => !erp.has(r));
+      if (unknown.length) throw new BusinessError(`Role ERP tidak ada: ${unknown.join(', ')}`);
+      clean[key] = roles;
+    }
+    await this.prisma.tenant.update({ where: { id: t.id }, data: { settings: { ...((t.settings as object) ?? {}), superappsRoleMap: clean } } });
+    this.dbMap = this.lower(clean);
+    await this.audit.log(actor, 'UPDATE', 'SuperAppsRoleMap', t.id, { roles: Object.keys(clean).length } as any);
+    return { ok: true, roles: Object.keys(clean).length };
+  }
+
+  /** Ikut ganti nama role ERP di pemetaan saat role di-rename */
+  async renameErpRole(tenantId: string, from: string, to: string) {
+    const t = await this.connectedTenant();
+    if (!t || t.id !== tenantId) return;
+    const m = this.storedMap(t.settings);
+    if (!m) return;
+    const next = Object.fromEntries(Object.entries(m).map(([k, v]) => [k, v.map((x) => (x === from ? to : x))]));
+    await this.prisma.tenant.update({ where: { id: t.id }, data: { settings: { ...((t.settings as object) ?? {}), superappsRoleMap: next } } });
+    this.dbMap = this.lower(next);
+  }
+
+  async isErpRoleMapped(tenantId: string, name: string) {
+    const t = await this.connectedTenant();
+    if (!t || t.id !== tenantId) return false;
+    const m = this.storedMap(t.settings) ?? this.roleMap;
+    return Object.values(m).some((v) => v.includes(name));
   }
 
   private async db(): Promise<Pool> {
@@ -133,7 +239,7 @@ export class SuperAppsService implements OnModuleInit, OnModuleDestroy {
   eligibility(u: SaUser): Eligibility {
     if (Number(u.isApproval) !== 1) return { ok: false, code: 'SUPERAPPS_NOT_APPROVED', reason: 'Akun SuperApps Anda belum disetujui.' };
     const roleName = (u.nama_role ?? '').trim();
-    const roles = this.roleMap[roleName.toLowerCase()];
+    const roles = this.activeMap[roleName.toLowerCase()];
     if (!roles?.length) return { ok: false, code: 'SUPERAPPS_ROLE_DENIED', reason: roleName ? `Role "${roleName}" tidak memiliki akses ke ERP Umira.` : 'Akun SuperApps Anda belum memiliki role.' };
     return { ok: true, roles };
   }
@@ -227,8 +333,13 @@ export class SuperAppsService implements OnModuleInit, OnModuleDestroy {
     } catch {
       host = null;
     }
-    return { enabled: this.enabled, tenant: this.tenantSlug, host, mappedRoles: Object.keys(this.roleMap).length, lastSync: this.lastSync ?? null };
+    return { enabled: this.enabled, tenant: this.tenantSlug, host, mappedRoles: Object.values(this.activeMap).filter((v) => v.length).length, roleMapSource: this.dbMap ? 'database' : 'file', lastSync: this.lastSync ?? null };
   }
+}
+
+class RoleMapDto {
+  /** { "Nama role SuperApps": ["Role ERP", ...] } — [] = tidak boleh masuk ERP */
+  @IsObject() map!: Record<string, string[]>;
 }
 
 @ApiTags('SuperApps')
@@ -239,6 +350,16 @@ export class SuperAppsController {
   @Get('status') @Perm('admin:read')
   status() {
     return this.svc.status();
+  }
+
+  @Get('role-map') @Perm('admin:read')
+  roleMap(@CurrentUser() u: AuthUser) {
+    return this.svc.getRoleMap(u);
+  }
+
+  @Put('role-map') @Perm('admin:write')
+  saveRoleMap(@CurrentUser() u: AuthUser, @Body() dto: RoleMapDto) {
+    return this.svc.saveRoleMap(u, dto.map);
   }
 
   @Post('sync-users') @Perm('admin:write')

@@ -1,7 +1,10 @@
 import { Body, Controller, Delete, Get, Injectable, Module, Param, Patch, Post, Query } from '@nestjs/common';
 import { ApiTags } from '@nestjs/swagger';
-import { ArrayMinSize, IsArray, IsBoolean, IsEmail, IsInt, IsOptional, IsString, Matches, Min, MinLength } from 'class-validator';
+import { ArrayMaxSize, ArrayMinSize, IsArray, IsBoolean, IsEmail, IsInt, IsOptional, IsString, Matches, MaxLength, Min, MinLength, ValidateIf } from 'class-validator';
+import { PERMISSION_MODULES, VALID_PERMISSIONS } from '../common/access';
+import { SuperAppsModule, SuperAppsService } from './superapps.module';
 import * as bcrypt from 'bcryptjs';
+import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuthUser, CurrentUser, Perm } from '../common/auth';
 import { AuditService, notFound } from '../common/common.service';
@@ -31,6 +34,13 @@ class UserDto {
   @IsString() @MinLength(8) password!: string;
   @IsArray() @ArrayMinSize(1) roleIds!: string[];
 }
+class RoleDto {
+  @IsString() @MinLength(2) @MaxLength(60) name!: string;
+  @IsOptional() @IsString() @MaxLength(190) description?: string;
+  @IsArray() @ArrayMaxSize(40) @IsString({ each: true }) permissions!: string[];
+  /** null = semua menu sesuai permission */
+  @IsOptional() @ValidateIf((o) => o.menus !== null) @IsArray() @ArrayMaxSize(60) @IsString({ each: true }) menus?: string[] | null;
+}
 class UserPatchDto {
   @IsOptional() @IsBoolean() isActive?: boolean;
   @IsOptional() @IsArray() roleIds?: string[];
@@ -38,7 +48,7 @@ class UserPatchDto {
 
 @Injectable()
 export class MasterService {
-  constructor(private prisma: PrismaService, private audit: AuditService) {}
+  constructor(private prisma: PrismaService, private audit: AuditService, private superapps: SuperAppsService) {}
 
   customers(u: AuthUser, search?: string) {
     return this.prisma.customer.findMany({
@@ -105,8 +115,56 @@ export class MasterService {
       roles: memberships.map((m) => ({ id: m.role.id, name: m.role.name })),
     }));
   }
-  roles(u: AuthUser) {
-    return this.prisma.role.findMany({ where: { tenantId: u.tenantId }, orderBy: { name: 'asc' } });
+  async roles(u: AuthUser) {
+    const rows = await this.prisma.role.findMany({ where: { tenantId: u.tenantId }, orderBy: { name: 'asc' }, include: { _count: { select: { memberships: true } } } });
+    return rows.map(({ _count, ...r }) => ({ ...r, users: _count.memberships, system: (r.permissions as string[]).includes('*') }));
+  }
+
+  accessCatalog() {
+    return { modules: PERMISSION_MODULES };
+  }
+
+  private cleanRole(dto: RoleDto) {
+    const name = dto.name.trim().replace(/\s+/g, ' ');
+    const bad = dto.permissions.filter((p) => !VALID_PERMISSIONS.has(p));
+    if (bad.length) throw new BusinessError(`Hak akses tidak dikenal: ${bad.join(', ')}`);
+    // "kelola" sudah termasuk "lihat" → simpan level tertinggi saja per modul
+    const perms = [...new Set(dto.permissions)].filter((p) => !(p.endsWith(':read') && dto.permissions.includes(p.replace(':read', ':write'))));
+    const menus = dto.menus === undefined || dto.menus === null ? null : [...new Set(dto.menus.map((m) => m.trim()).filter((m) => /^\/[a-z0-9/_-]*$/i.test(m)))];
+    return { name, description: dto.description?.trim() || null, permissions: perms, menus };
+  }
+
+  async createRole(u: AuthUser, dto: RoleDto) {
+    const d = this.cleanRole(dto);
+    if (await this.prisma.role.findFirst({ where: { tenantId: u.tenantId, name: d.name } })) throw new BusinessError(`Role "${d.name}" sudah ada`);
+    const r = await this.prisma.role.create({ data: { tenantId: u.tenantId, ...d, menus: d.menus ?? Prisma.DbNull } });
+    await this.audit.log(u, 'CREATE', 'Role', r.id, d as any);
+    return r;
+  }
+
+  async updateRole(u: AuthUser, id: string, dto: RoleDto) {
+    const r = notFound(await this.prisma.role.findFirst({ where: { id, tenantId: u.tenantId } }), 'Role');
+    const system = (r.permissions as string[]).includes('*');
+    const d = this.cleanRole(dto);
+    if (d.name !== r.name && (await this.prisma.role.findFirst({ where: { tenantId: u.tenantId, name: d.name, id: { not: id } } }))) throw new BusinessError(`Role "${d.name}" sudah ada`);
+    // Role Administrator (akses penuh) tidak bisa dikurangi agar admin tidak terkunci
+    const data = system
+      ? { name: d.name, description: d.description }
+      : { name: d.name, description: d.description, permissions: d.permissions, menus: d.menus ?? Prisma.DbNull };
+    const res = await this.prisma.role.update({ where: { id }, data });
+    if (d.name !== r.name) await this.superapps.renameErpRole(u.tenantId, r.name, d.name);
+    await this.audit.log(u, 'UPDATE', 'Role', id, { before: { name: r.name, permissions: r.permissions, menus: r.menus }, after: d } as any);
+    return res;
+  }
+
+  async deleteRole(u: AuthUser, id: string) {
+    const r = notFound(await this.prisma.role.findFirst({ where: { id, tenantId: u.tenantId }, include: { _count: { select: { memberships: true } } } }), 'Role');
+    if ((r.permissions as string[]).includes('*')) throw new BusinessError('Role dengan akses penuh tidak bisa dihapus');
+    if (r._count.memberships) throw new BusinessError(`Role masih dipakai ${r._count.memberships} user. Pindahkan user ke role lain dulu.`, 'ROLE_IN_USE');
+    if (await this.superapps.isErpRoleMapped(u.tenantId, r.name)) throw new BusinessError('Role masih dipakai di pemetaan SuperApps. Ubah pemetaannya dulu.', 'ROLE_IN_USE');
+    await this.prisma.role.delete({ where: { id } });
+    await this.audit.log(u, 'DELETE', 'Role', id, { name: r.name });
+    return { ok: true };
   }
   private async assertRoles(u: AuthUser, roleIds: string[]) {
     const n = await this.prisma.role.count({ where: { tenantId: u.tenantId, id: { in: roleIds } } });
@@ -129,7 +187,7 @@ export class MasterService {
   }
   async updateUser(u: AuthUser, id: string, dto: UserPatchDto) {
     const target = notFound(await this.prisma.user.findFirst({ where: { id, tenantId: u.tenantId } }), 'User');
-    if (target.externalSource && dto.roleIds) throw new BusinessError('Role user SuperApps mengikuti SuperApps (atur di file pemetaan role). Di ERP hanya bisa diaktifkan/nonaktifkan.', 'EXTERNAL_USER_ROLES');
+    if (target.externalSource && dto.roleIds) throw new BusinessError('Role user SuperApps mengikuti SuperApps (atur di Role & menu → Pemetaan SuperApps). Di ERP hanya bisa diaktifkan/nonaktifkan.', 'EXTERNAL_USER_ROLES');
     if (id === u.userId && dto.isActive === false) throw new BusinessError('Tidak dapat menonaktifkan akun sendiri');
     await this.prisma.$transaction(async (tx) => {
       if (dto.isActive !== undefined) {
@@ -190,6 +248,14 @@ export class MasterController {
   updateUser(@CurrentUser() u: AuthUser, @Param('id') id: string, @Body() dto: UserPatchDto) { return this.svc.updateUser(u, id, dto); }
   @Get('roles') @Perm('admin:read')
   roles(@CurrentUser() u: AuthUser) { return this.svc.roles(u); }
+  @Get('roles/catalog') @Perm('admin:read')
+  catalog() { return this.svc.accessCatalog(); }
+  @Post('roles') @Perm('admin:write')
+  createRole(@CurrentUser() u: AuthUser, @Body() dto: RoleDto) { return this.svc.createRole(u, dto); }
+  @Patch('roles/:id') @Perm('admin:write')
+  updateRole(@CurrentUser() u: AuthUser, @Param('id') id: string, @Body() dto: RoleDto) { return this.svc.updateRole(u, id, dto); }
+  @Delete('roles/:id') @Perm('admin:write')
+  deleteRole(@CurrentUser() u: AuthUser, @Param('id') id: string) { return this.svc.deleteRole(u, id); }
 
   @Get('audit-logs') @Perm('audit:read', 'admin:read')
   audit(@CurrentUser() u: AuthUser, @Query('entityType') entityType?: string, @Query('search') search?: string) {
@@ -197,5 +263,5 @@ export class MasterController {
   }
 }
 
-@Module({ controllers: [MasterController], providers: [MasterService] })
+@Module({ imports: [SuperAppsModule], controllers: [MasterController], providers: [MasterService] })
 export class MasterModule {}

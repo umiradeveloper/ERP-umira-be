@@ -443,6 +443,30 @@ describe('Contractor ERP API (e2e)', () => {
       // tenant lain tidak bisa menjalankan sinkron SuperApps
       await request(http).post('/api/v1/superapps/sync-users').set(as('bAdmin')).expect(422);
     });
+    it('pemetaan role SuperApps bisa diatur dari halaman admin dan role kustom membatasi menu', async () => {
+      const g = (await request(http).get('/api/v1/superapps/role-map').set(as('admin')).expect(200)).body.data;
+      expect(g).toMatchObject({ enabled: true, source: 'file' });
+      expect(g.roles.find((r: any) => r.name === 'Staff Procurement')).toMatchObject({ users: 1, erpRoles: ['Procurement'] });
+      expect(g.roles.find((r: any) => r.name === 'Vendor').erpRoles).toEqual([]);
+
+      // role kustom: hanya lihat proyek, menu Proyek saja
+      const role = (await request(http).post('/api/v1/roles').set(as('admin')).send({ name: 'Vendor Portal', description: 'Uji', permissions: ['project:read'], menus: ['/dashboard', '/projects'] }).expect(201)).body.data;
+      await request(http).put('/api/v1/superapps/role-map').set(as('admin')).send({ map: { 'Staff Procurement': ['Procurement'], 'Project manager': ['Project Manager'], Vendor: ['Tidak Ada'] } }).expect(422);
+      await request(http).put('/api/v1/superapps/role-map').set(as('pm')).send({ map: {} }).expect(403);
+      await request(http).put('/api/v1/superapps/role-map').set(as('admin')).send({ map: { 'Staff Procurement': ['Procurement'], 'Project manager': ['Project Manager'], Vendor: ['Vendor Portal'] } }).expect(200);
+      const v = await loginSa('vendor@uji.test').expect(201);
+      expect(v.body.data.user).toMatchObject({ roles: ['Vendor Portal'], perms: ['project:read'], menus: ['/dashboard', '/projects'] });
+      expect((await request(http).get('/api/v1/superapps/role-map').set(as('admin'))).body.data.source).toBe('database');
+
+      // ganti nama role → pemetaan ikut; role yang dipakai tidak bisa dihapus
+      await request(http).patch(`/api/v1/roles/${role.id}`).set(as('admin')).send({ name: 'Portal Vendor', permissions: ['project:read', 'procurement:read'], menus: null }).expect(200);
+      const v2 = await loginSa('vendor@uji.test').expect(201);
+      expect(v2.body.data.user).toMatchObject({ roles: ['Portal Vendor'], menus: null });
+      expect(v2.body.data.user.perms.sort()).toEqual(['procurement:read', 'project:read']);
+      expect((await request(http).delete(`/api/v1/roles/${role.id}`).set(as('admin')).expect(422)).body.error.code).toBe('ROLE_IN_USE');
+      // kembalikan pemetaan agar tes lain tidak terpengaruh
+      app.get(SuperAppsService).setRoleMap({ 'Staff Procurement': ['Procurement'], 'Project manager': ['Project Manager'], Vendor: [] });
+    });
   });
 
   describe('BK/PU penetapan, efisiensi & foto proyek', () => {
@@ -545,6 +569,78 @@ describe('Contractor ERP API (e2e)', () => {
       await request(http).post(`/api/v1/projects/${p.body.data.id}/rap/approve`).set(as('admin')).expect(422);
       await request(http).put(`/api/v1/projects/${p.body.data.id}/rap`).set(as('admin')).send({ items: [{ section: 'A', code: 'A.1', description: 'Pekerjaan tanah', unit: 'm3', category: 'LABOR', quantity: '100', unitRate: '75000' }] }).expect(200);
       await request(http).put(`/api/v1/projects/${p.body.data.id}/rap`).set(as('fin')).send({ items: [] }).expect(403);
+    });
+  });
+  describe('Role & menu', () => {
+    it('admin bisa membuat, mengubah dan menghapus role; hak akses divalidasi', async () => {
+      await request(http).post('/api/v1/roles').set(as('pm')).send({ name: 'X', permissions: [] }).expect(403);
+      await request(http).post('/api/v1/roles').set(as('admin')).send({ name: 'Salah', permissions: ['*'] }).expect(422);
+      await request(http).post('/api/v1/roles').set(as('admin')).send({ name: 'Finance', permissions: [] }).expect(422);
+      const r = (await request(http).post('/api/v1/roles').set(as('admin')).send({ name: 'Staf Gudang', permissions: ['warehouse:write', 'warehouse:read', 'project:read'], menus: ['/inventory', '/inventory'] }).expect(201)).body.data;
+      expect(r.permissions.sort()).toEqual(['project:read', 'warehouse:write']);
+      expect(r.menus).toEqual(['/inventory']);
+      const cat = (await request(http).get('/api/v1/roles/catalog').set(as('admin')).expect(200)).body.data;
+      expect(cat.modules.map((m: any) => m.key)).toContain('procurement');
+      const list = (await request(http).get('/api/v1/roles').set(as('admin')).expect(200)).body.data;
+      expect(list.find((x: any) => x.name === 'Administrator')).toMatchObject({ system: true });
+      expect(list.find((x: any) => x.name === 'Staf Gudang')).toMatchObject({ users: 0, system: false });
+      await request(http).delete(`/api/v1/roles/${r.id}`).set(as('admin')).expect(200);
+    });
+    it('role Administrator tidak bisa dikurangi aksesnya atau dihapus', async () => {
+      const admin = await prisma.role.findFirstOrThrow({ where: { tenantId: tenantIds[0], name: 'Administrator' } });
+      await request(http).patch(`/api/v1/roles/${admin.id}`).set(as('admin')).send({ name: 'Administrator', permissions: ['project:read'], menus: ['/projects'] }).expect(200);
+      const a = await prisma.role.findUniqueOrThrow({ where: { id: admin.id } });
+      expect(a.permissions).toEqual(['*']);
+      expect(a.menus).toBeNull();
+      await request(http).delete(`/api/v1/roles/${admin.id}`).set(as('admin')).expect(422);
+    });
+    it('menu role ikut ke sesi user (null = semua menu sesuai hak akses)', async () => {
+      const pmRole = await prisma.role.findFirstOrThrow({ where: { tenantId: tenantIds[0], name: 'Project Manager' } });
+      const before = (await request(http).post('/api/v1/auth/login').send({ tenant: A, email: `pm@${A}.test`, password: PASS }).expect(201)).body.data.user;
+      expect(before.menus).toBeNull();
+      await request(http).patch(`/api/v1/roles/${pmRole.id}`).set(as('admin')).send({ name: 'Project Manager', permissions: pmRole.permissions, menus: ['/dashboard', '/projects'] }).expect(200);
+      const after = (await request(http).post('/api/v1/auth/login').send({ tenant: A, email: `pm@${A}.test`, password: PASS }).expect(201)).body.data.user;
+      expect(after.menus).toEqual(['/dashboard', '/projects']);
+      await request(http).patch(`/api/v1/roles/${pmRole.id}`).set(as('admin')).send({ name: 'Project Manager', permissions: pmRole.permissions, menus: null }).expect(200);
+    });
+  });
+
+  describe('Hapus proyek', () => {
+    it('hanya admin; perlu konfirmasi kode; ikut menghapus RAB/RAP, PR, laporan, file; tender dilepas', async () => {
+      const t = await request(http).post('/api/v1/tenders').set(as('admin')).send({ title: 'Tender hapus' }).expect(201);
+      await request(http).put(`/api/v1/tenders/${t.body.data.id}/items`).set(as('admin')).send({ items: [{ section: 'A', code: 'A.1', description: 'Galian', unit: 'm3', category: 'LABOR', quantity: '10', unitCost: '50000' }] }).expect(200);
+      await request(http).post(`/api/v1/tenders/${t.body.data.id}/submit`).set(as('admin')).expect(201);
+      const pid = (await request(http).post(`/api/v1/tenders/${t.body.data.id}/decision`).set(as('admin')).send({ decision: 'WON' }).expect(201)).body.data.projectId;
+      const p = (await request(http).get(`/api/v1/projects/${pid}`).set(as('admin'))).body.data;
+      const pr = await request(http).post('/api/v1/purchase-requests').set(as('pm')).send({ projectId: pid, items: [{ description: 'Semen', quantity: '10', estimatedPrice: '70000', category: 'MATERIAL' }] }).expect(201);
+      await request(http).post(`/api/v1/purchase-requests/${pr.body.data.id}/submit`).set(as('pm')).expect(201);
+      await request(http).post(`/api/v1/projects/${pid}/daily-reports`).set(as('pm')).send({ reportDate: '2026-11-20', weather: 'Cerah', manpower: 5, activities: 'Galian' }).expect(201);
+      await request(http).post('/api/v1/files').set(as('admin')).field('entityType', 'Project').field('entityId', pid).attach('files', Buffer.from([0x89, 0x50, 0x4e, 0x47]), { filename: 'f.png', contentType: 'image/png' }).expect(201);
+
+      await request(http).get(`/api/v1/projects/${pid}/delete-check`).set(as('pm')).expect(403);
+      await request(http).delete(`/api/v1/projects/${pid}`).set(as('pm')).expect(403);
+      const chk = (await request(http).get(`/api/v1/projects/${pid}/delete-check`).set(as('admin')).expect(200)).body.data;
+      expect(chk).toMatchObject({ canDelete: true, blockers: [], tender: t.body.data.number });
+      expect(chk.willDelete).toMatchObject({ rab: 1, purchaseRequests: 1, dailyReports: 1, files: 1 });
+      const noConfirm = await request(http).delete(`/api/v1/projects/${pid}`).set(as('admin')).expect(422);
+      expect(noConfirm.body.error.code).toBe('CONFIRM_REQUIRED');
+      await request(http).delete(`/api/v1/projects/${pid}?confirm=${p.code}`).set(as('admin')).expect(200);
+
+      await request(http).get(`/api/v1/projects/${pid}`).set(as('admin')).expect(404);
+      const tn = (await request(http).get(`/api/v1/tenders/${t.body.data.id}`).set(as('admin')).expect(200)).body.data;
+      expect(tn.projectId).toBeNull();
+      expect(await prisma.purchaseRequest.count({ where: { id: pr.body.data.id } })).toBe(0);
+      expect(await prisma.approvalRequest.count({ where: { entityId: pr.body.data.id } })).toBe(0);
+      expect(await prisma.fileObject.count({ where: { entityId: pid } })).toBe(0);
+      const inbox = (await request(http).get('/api/v1/approvals/inbox').set(as('admin'))).body.data;
+      expect(inbox.some((x: any) => x.entityId === pr.body.data.id)).toBe(false);
+    });
+    it('proyek yang sudah punya PO/invoice/jurnal tidak bisa dihapus', async () => {
+      const chk = (await request(http).get(`/api/v1/projects/${projectA}/delete-check`).set(as('admin')).expect(200)).body.data;
+      expect(chk.canDelete).toBe(false);
+      expect(chk.blockers.join(' ')).toMatch(/purchase order/);
+      const r = await request(http).delete(`/api/v1/projects/${projectA}?confirm=${chk.project.code}`).set(as('admin')).expect(422);
+      expect(r.body.error.code).toBe('PROJECT_HAS_TRANSACTIONS');
     });
   });
 });

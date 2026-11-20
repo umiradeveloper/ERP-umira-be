@@ -1,3 +1,4 @@
+import { menusFor } from '../common/access';
 import { Body, Controller, Get, Injectable, Module, Post, UnauthorizedException } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { Throttle } from '@nestjs/throttler';
@@ -41,6 +42,7 @@ export class AuthService {
     });
     const roles = [...new Set(user.memberships.map((m) => m.role.name))];
     const perms = [...new Set(user.memberships.flatMap((m) => (m.role.permissions as string[]) ?? []))];
+    const menus = menusFor(user.memberships.map((m) => m.role));
 
     const accessToken = this.jwt.sign(
       { sub: user.id, tid: user.tenantId, name: user.name, email: user.email, roles, perms },
@@ -69,6 +71,7 @@ export class AuthService {
         title: user.title,
         roles,
         perms,
+        menus,
         tenant: { id: user.tenant.id, name: user.tenant.name, slug: user.tenant.slug },
       },
     };
