@@ -88,6 +88,11 @@ export class AllExceptionsFilter implements ExceptionFilter {
         status = HttpStatus.NOT_FOUND;
         code = 'NOT_FOUND';
         message = 'Data tidak ditemukan';
+      } else if (exception.code === 'P2000') {
+        const col = (exception.meta as any)?.column_name ?? (exception.message.match(/Column: (\w+)/)?.[1]);
+        status = HttpStatus.UNPROCESSABLE_ENTITY;
+        code = 'VALUE_TOO_LONG';
+        message = `Isian ${col ? `"${col}" ` : ''}terlalu panjang. Persingkat teksnya lalu simpan lagi.`;
       }
     }
 

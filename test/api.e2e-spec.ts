@@ -492,5 +492,13 @@ describe('Contractor ERP API (e2e)', () => {
       expect(Number(got[0].amount)).toBe(Math.round(12.345678 * 1152345.678912 * 100) / 100);
       expect(Number(got[1].amount)).toBe(Math.round(2500.5 * 14231.4567 * 100) / 100);
     });
+    it('uraian BQ yang panjang (mis. spesifikasi AHSP) bisa disimpan', async () => {
+      const t = await request(http).post('/api/v1/tenders').set(as('admin')).send({ title: 'Tender uraian panjang' }).expect(201);
+      const long = 'Pekerjaan beton bertulang mutu fc 25 MPa termasuk bekisting, pembesian, pengecoran, perawatan beton dan pengujian sampel silinder sesuai spesifikasi teknis. '.repeat(6);
+      const r = await request(http).put(`/api/v1/tenders/${t.body.data.id}/items`).set(as('admin'))
+        .send({ items: [{ section: 'III. PEKERJAAN STRUKTUR ATAS — GEDUNG UTAMA LANTAI 1 SAMPAI DENGAN LANTAI ATAP TERMASUK TANGGA DAN RAMP', code: 'III.1', description: long, unit: 'm3', category: 'MATERIAL', quantity: '1', unitCost: '1' }] })
+        .expect(200);
+      expect(r.body.data.items[0].description).toBe(long);
+    });
   });
 });
