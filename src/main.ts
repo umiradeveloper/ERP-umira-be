@@ -4,6 +4,7 @@ import { Logger, ValidationPipe } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { AppModule } from './app.module';
+import { json, urlencoded } from 'express';
 
 async function bootstrap() {
   for (const k of ['DATABASE_URL', 'JWT_ACCESS_SECRET']) {
@@ -14,6 +15,15 @@ async function bootstrap() {
   app.setGlobalPrefix('api/v1');
   app.enableCors({ origin: (process.env.WEB_ORIGIN ?? 'http://localhost:3000').split(','), credentials: true });
   app.useGlobalPipes(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true }));
+
+   // Maksimum JSON 50 MB
+  app.use(json({ limit: '50mb' }));
+
+  // Maksimum URL encoded 50 MB
+  app.use(urlencoded({
+    extended: true,
+    limit: '50mb',
+  }));
 
   const config = new DocumentBuilder()
     .setTitle('Contractor ERP API')
