@@ -1,9 +1,9 @@
-import { Body, Controller, Delete, Get, Injectable, Module, Param, Patch, Post, Put, Query } from '@nestjs/common';
+import { Body, Controller, Delete, ForbiddenException, Get, Injectable, Module, Param, Patch, Post, Put, Query } from '@nestjs/common';
 import { unlinkSync } from 'fs';
 import { resolve } from 'path';
 import { Type } from 'class-transformer';
 import { ApiTags } from '@nestjs/swagger';
-import { IsDateString, IsIn, IsInt, IsNumberString, IsOptional, IsString, MaxLength, Min, ValidateIf, ValidateNested } from 'class-validator';
+import { IsBoolean, IsDateString, IsIn, IsInt, IsNumberString, IsOptional, IsString, MaxLength, Min, ValidateIf, ValidateNested } from 'class-validator';
 import { CostCategory, Prisma, ProjectStatus } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuthUser, CurrentUser, Perm } from '../common/auth';
@@ -47,6 +47,14 @@ class RapItemDto {
 class RapDto {
   @ValidateNested({ each: true }) @Type(() => RapItemDto) items!: RapItemDto[];
 }
+class RapApproveDto {
+  /** Revisi: hitung ulang BK/PU penetapan dari RAP revisi (default tetap memakai BK/PU awal) */
+  @IsOptional() @IsBoolean() recomputeBkpu?: boolean;
+}
+class RapReviseDto {
+  @IsString() @MaxLength(1000) reason!: string;
+}
+
 /** Progres kumulatif: isi dalam persen (plannedPct/actualPct) ATAU Rupiah (plannedValue/actualValue) terhadap total RAB */
 class ProgressDto {
   @IsDateString() reportDate!: string;
@@ -101,9 +109,13 @@ export class CostService {
       orderBy: { revision: 'desc' },
       include: { items: { select: { category: true, amount: true } } },
     });
+    // Budget yang berlaku: revisi RAP terakhir yang sudah ditetapkan; draf revisi baru berlaku setelah ditetapkan.
+    // Proyek yang RAP-nya belum pernah ditetapkan memakai draf terakhir.
+    const hasApproved = new Set(budgets.filter((b) => b.approvedAt).map((b) => b.projectId));
     const seen = new Set<string>();
     for (const b of budgets) {
       if (seen.has(b.projectId)) continue;
+      if (hasApproved.has(b.projectId) && !b.approvedAt) continue;
       seen.add(b.projectId);
       for (const i of b.items) get(b.projectId, i.category).budget = get(b.projectId, i.category).budget.plus(i.amount);
     }
@@ -256,14 +268,22 @@ export class ProjectsService {
     const buckets = await this.cost.buckets(u.tenantId, [id]);
     const cost = this.cost.summarize(buckets.get(id));
     const bkpu = (await this.bkpu(u.tenantId, [p])).get(p.id)!;
-    const rapBudget = await this.prisma.budget.findFirst({ where: { tenantId: u.tenantId, projectId: p.id, isBaseline: true }, orderBy: { revision: 'desc' }, select: { approvedAt: true, _count: { select: { items: true } } } });
+    const rapBudgets = await this.prisma.budget.findMany({ where: { tenantId: u.tenantId, projectId: p.id, isBaseline: true }, orderBy: { revision: 'desc' }, select: { revision: true, approvedAt: true, _count: { select: { items: true } } } });
+    const rapLatest = rapBudgets[0];
+    const rapApproved = rapBudgets.find((b) => b.approvedAt);
     const progressBase = await this.progressBase(u.tenantId, p);
     const billedGross = invoices.filter((i) => !['DRAFT', 'CANCELLED'].includes(i.status)).reduce((a, i) => a.plus(i.grossAmount), ZERO);
     const received = invoices.reduce((a, i) => a.plus(i.paidAmount), ZERO);
     return {
       ...p,
       ...bkpu,
-      rap: { approvedAt: rapBudget?.approvedAt ?? null, items: rapBudget?._count.items ?? 0 },
+      rap: {
+        approvedAt: rapApproved?.approvedAt ?? null,
+        revision: rapApproved?.revision ?? null,
+        items: rapLatest?._count.items ?? 0,
+        // ada draf revisi yang belum ditetapkan
+        revisionDraft: !!rapLatest && !rapLatest.approvedAt && !!rapApproved ? rapLatest.revision : null,
+      },
       progress,
       progressBase: { value: progressBase.base, source: progressBase.source },
       dailyReports,
@@ -300,10 +320,22 @@ export class ProjectsService {
     ]);
     const totalRab = sumD(rab.map((r) => r.amount));
     const totalRap = sumD((budget?.items ?? []).map((i) => i.amount));
+    const revs = await this.prisma.budget.findMany({
+      where: { tenantId: u.tenantId, projectId: id, isBaseline: true }, orderBy: { revision: 'desc' },
+      select: { id: true, name: true, revision: true, approvedAt: true, revisionNote: true, createdAt: true, createdBy: true, approvedBy: true, items: { select: { amount: true } } },
+    });
+    const ids = [...new Set(revs.flatMap((r) => [r.createdBy, r.approvedBy]).filter(Boolean) as string[])];
+    const names = new Map((ids.length ? await this.prisma.user.findMany({ where: { id: { in: ids } }, select: { id: true, name: true } }) : []).map((x) => [x.id, x.name]));
+    const revisions = revs.map(({ items, ...r }) => ({ ...r, total: sumD(items.map((i) => i.amount)), createdByName: r.createdBy ? names.get(r.createdBy) ?? null : null, approvedByName: r.approvedBy ? names.get(r.approvedBy) ?? null : null }));
+    const current = revisions.find((r) => r.approvedAt) ?? null;
     return {
       budget,
       rab,
       locked: !!budget?.approvedAt,
+      revisions,
+      /** draf revisi terbuka di atas RAP yang sudah ditetapkan */
+      isRevisionDraft: !!budget && !budget.approvedAt && !!current,
+      current: current ? { revision: current.revision, total: current.total, approvedAt: current.approvedAt } : null,
       totals: {
         rab: totalRab, rap: totalRap, selisih: totalRab.minus(totalRap),
         bkpuPct: totalRab.gt(0) && totalRap.gt(0) ? totalRap.div(totalRab).mul(100).toDecimalPlaces(2).toNumber() : null,
@@ -316,7 +348,7 @@ export class ProjectsService {
     notFound(await this.prisma.project.findFirst({ where: { id, tenantId: u.tenantId } }), 'Proyek');
     let b = await this.prisma.budget.findFirst({ where: { tenantId: u.tenantId, projectId: id, isBaseline: true }, orderBy: { revision: 'desc' } });
     if (!b) b = await this.prisma.budget.create({ data: { tenantId: u.tenantId, projectId: id, name: 'RAP', isBaseline: true } });
-    if (b.approvedAt) throw new BusinessError('RAP sudah ditetapkan. Perubahan setelah penetapan dilakukan lewat Variation order.', 'RAP_LOCKED');
+    if (b.approvedAt) throw new BusinessError('RAP sudah ditetapkan. Perubahan dilakukan lewat Revisi RAP (Administrator) atau Variation order.', 'RAP_LOCKED');
     return b;
   }
 
@@ -343,8 +375,10 @@ export class ProjectsService {
     return this.rap(u, id);
   }
 
-  async approveRap(u: AuthUser, id: string) {
+  async approveRap(u: AuthUser, id: string, opts: { recomputeBkpu?: boolean } = {}) {
     const b = await this.draftRap(u, id);
+    const prior = await this.prisma.budget.findFirst({ where: { tenantId: u.tenantId, projectId: id, isBaseline: true, approvedAt: { not: null } } });
+    if (prior && !u.perms.includes('*') && !u.perms.includes('admin:write')) throw new ForbiddenException('Revisi RAP hanya bisa ditetapkan oleh Administrator');
     const count = await this.prisma.budgetItem.count({ where: { budgetId: b.id } });
     if (!count) throw new BusinessError('RAP masih kosong. Isi dan simpan RAP terlebih dahulu.');
     // BK/PU penetapan = BK/PU awal saat RAP ditetapkan: total RAP ÷ total RAB (tanpa RAB: ÷ nilai kontrak)
@@ -356,11 +390,57 @@ export class ProjectsService {
     const pu = D(rab._sum.amount).gt(0) ? D(rab._sum.amount) : p.contractValue;
     const bkpu = pu.gt(0) ? D(rap._sum.amount).div(pu).mul(100).toDecimalPlaces(2) : null;
     if (bkpu && bkpu.gt(99999)) throw new BusinessError('BK/PU RAP tidak wajar. Periksa nilai RAP dan RAB.');
+    // Penetapan pertama selalu mengisi BK/PU penetapan; revisi hanya bila diminta (default: tetap memakai BK/PU awal)
+    const setBkpu = !prior || !!opts.recomputeBkpu;
     await this.prisma.$transaction([
-      this.prisma.budget.update({ where: { id: b.id }, data: { approvedAt: new Date() } }),
-      this.prisma.project.update({ where: { id }, data: { bkpuPenetapanPct: bkpu } }),
+      this.prisma.budget.update({ where: { id: b.id }, data: { approvedAt: new Date(), approvedBy: u.userId } }),
+      ...(setBkpu ? [this.prisma.project.update({ where: { id }, data: { bkpuPenetapanPct: bkpu } })] : []),
     ]);
-    await this.audit.log(u, 'APPROVE_RAP', 'Project', id, { budgetId: b.id, bkpuPenetapanPct: bkpu?.toString() ?? null });
+    await this.audit.log(u, prior ? 'APPROVE_RAP_REVISION' : 'APPROVE_RAP', 'Project', id, { budgetId: b.id, revision: b.revision, bkpuPenetapanPct: setBkpu ? bkpu?.toString() ?? null : 'tetap' });
+    return this.rap(u, id);
+  }
+
+  /**
+   * Revisi RAP setelah ditetapkan (khusus Administrator): RAP yang berlaku disalin menjadi draf revisi baru.
+   * RAP lama tetap berlaku untuk cost control sampai revisi ditetapkan; riwayat revisi disimpan.
+   */
+  async reviseRap(u: AuthUser, id: string, reason: string) {
+    const note = (reason ?? '').trim();
+    if (note.length < 5) throw new BusinessError('Alasan revisi wajib diisi (minimal 5 karakter)');
+    notFound(await this.prisma.project.findFirst({ where: { id, tenantId: u.tenantId } }), 'Proyek');
+    const latest = await this.prisma.budget.findFirst({ where: { tenantId: u.tenantId, projectId: id, isBaseline: true }, orderBy: { revision: 'desc' }, include: { items: true } });
+    if (!latest) throw new BusinessError('Proyek belum punya RAP');
+    if (!latest.approvedAt) throw new BusinessError('Masih ada RAP draf yang belum ditetapkan. Lanjutkan atau batalkan draf tersebut.', 'RAP_DRAFT_OPEN');
+    const pendingVo = await this.prisma.variationOrder.count({ where: { tenantId: u.tenantId, projectId: id, status: 'IN_APPROVAL' } });
+    if (pendingVo) throw new BusinessError(`Ada ${pendingVo} variation order yang sedang dalam approval. Selesaikan dulu sebelum merevisi RAP.`, 'VO_PENDING');
+    const p = await this.prisma.project.findUniqueOrThrow({ where: { id } });
+    const rev = latest.revision + 1;
+    const b = await this.prisma.$transaction(async (tx) => {
+      const nb = await tx.budget.create({
+        data: { tenantId: u.tenantId, projectId: id, isBaseline: true, revision: rev, name: `RAP ${p.code} rev ${rev}`, revisionNote: note, createdBy: u.userId },
+      });
+      if (latest.items.length) {
+        await tx.budgetItem.createMany({ data: latest.items.map(({ id: _i, budgetId: _b, ...i }) => ({ ...i, budgetId: nb.id })) });
+      }
+      return nb;
+    });
+    await this.audit.log(u, 'REVISE_RAP', 'Project', id, { from: latest.revision, to: rev, reason: note });
+    return this.rap(u, b.projectId);
+  }
+
+  /** Batalkan draf revisi RAP: kembali ke RAP terakhir yang ditetapkan */
+  async cancelRapRevision(u: AuthUser, id: string) {
+    notFound(await this.prisma.project.findFirst({ where: { id, tenantId: u.tenantId } }), 'Proyek');
+    const [latest, approved] = await Promise.all([
+      this.prisma.budget.findFirst({ where: { tenantId: u.tenantId, projectId: id, isBaseline: true }, orderBy: { revision: 'desc' } }),
+      this.prisma.budget.findFirst({ where: { tenantId: u.tenantId, projectId: id, isBaseline: true, approvedAt: { not: null } } }),
+    ]);
+    if (!latest || latest.approvedAt || !approved) throw new BusinessError('Tidak ada draf revisi RAP yang bisa dibatalkan');
+    await this.prisma.$transaction([
+      this.prisma.budgetItem.deleteMany({ where: { budgetId: latest.id } }),
+      this.prisma.budget.delete({ where: { id: latest.id } }),
+    ]);
+    await this.audit.log(u, 'CANCEL_RAP_REVISION', 'Project', id, { revision: latest.revision });
     return this.rap(u, id);
   }
 
@@ -623,7 +703,7 @@ export class ProjectsService {
       }),
       this.prisma.bqItem.aggregate({ where: { tenantId: t, projectId: id }, _sum: { amount: true } }),
       this.bkpu(t, [p]),
-      this.prisma.budget.findFirst({ where: { tenantId: t, projectId: id, isBaseline: true }, orderBy: { revision: 'desc' }, select: { approvedAt: true, name: true } }),
+      this.prisma.budget.findFirst({ where: { tenantId: t, projectId: id, isBaseline: true, approvedAt: { not: null } }, orderBy: { revision: 'desc' }, select: { approvedAt: true, name: true } }),
     ]);
     const sum = this.cost.summarize(buckets.get(id));
 
@@ -700,7 +780,11 @@ export class ProjectsController {
   @Put('projects/:id/rap') @Perm('project:write')
   saveRap(@CurrentUser() u: AuthUser, @Param('id') id: string, @Body() dto: RapDto) { return this.svc.saveRap(u, id, dto); }
   @Post('projects/:id/rap/approve') @Perm('project:write')
-  approveRap(@CurrentUser() u: AuthUser, @Param('id') id: string) { return this.svc.approveRap(u, id); }
+  approveRap(@CurrentUser() u: AuthUser, @Param('id') id: string, @Body() dto: RapApproveDto) { return this.svc.approveRap(u, id, dto); }
+  @Post('projects/:id/rap/revise') @Perm('admin:write')
+  reviseRap(@CurrentUser() u: AuthUser, @Param('id') id: string, @Body() dto: RapReviseDto) { return this.svc.reviseRap(u, id, dto.reason); }
+  @Delete('projects/:id/rap/revision') @Perm('admin:write')
+  cancelRapRevision(@CurrentUser() u: AuthUser, @Param('id') id: string) { return this.svc.cancelRapRevision(u, id); }
   @Get('projects/:id/budget') @Perm('project:read', 'cost:read')
   budget(@CurrentUser() u: AuthUser, @Param('id') id: string) { return this.svc.budget(u, id); }
   @Get('projects/:id/costs') @Perm('cost:read', 'project:read')

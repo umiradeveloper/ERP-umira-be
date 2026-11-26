@@ -119,6 +119,10 @@ export class VariationOrdersService implements OnModuleInit {
     return this.prisma.$transaction(async (tx) => {
       const vo = notFound(await tx.variationOrder.findFirst({ where: { id, tenantId: u.tenantId }, include: { items: true, project: true } }), 'VO');
       if (!['DRAFT', 'REVISION'].includes(vo.status)) throw new BusinessError('VO sudah diajukan');
+      const latest = await tx.budget.findFirst({ where: { tenantId: u.tenantId, projectId: vo.projectId, isBaseline: true }, orderBy: { revision: 'desc' } });
+      if (latest && !latest.approvedAt && (await tx.budget.count({ where: { tenantId: u.tenantId, projectId: vo.projectId, isBaseline: true, approvedAt: { not: null } } }))) {
+        throw new BusinessError('RAP proyek sedang direvisi. Tetapkan atau batalkan revisi RAP sebelum mengajukan VO.', 'RAP_REVISION_OPEN');
+      }
       await tx.variationOrder.update({ where: { id }, data: { status: 'IN_APPROVAL' } });
       // Nominal approval = dampak terbesar antara perubahan kontrak dan perubahan budget
       const budgetChange = sumD(vo.items.map((i) => i.amount)).abs();

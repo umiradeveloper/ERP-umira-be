@@ -435,6 +435,10 @@ model Budget {
   revision   Int       @default(1)
   isBaseline Boolean   @default(false)
   approvedAt DateTime?
+  /// Alasan revisi RAP (diisi saat Administrator membuka revisi)
+  revisionNote String? @db.Text
+  createdBy    String? @db.Char(36)
+  approvedBy   String? @db.Char(36)
   createdAt  DateTime  @default(now())
 
   project Project      @relation(fields: [projectId], references: [id])

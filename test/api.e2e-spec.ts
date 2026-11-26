@@ -568,6 +568,45 @@ describe('Contractor ERP API (e2e)', () => {
       const cost = (await request(http).get(`/api/v1/projects/${projectId}`).set(as('admin'))).body.data.cost;
       expect(Number(cost.total.budget)).toBe(4500000 + 10.5 * 1100000 + 24000000);
     });
+    it('revisi RAP: hanya admin, wajib alasan; RAP lama tetap berlaku sampai revisi ditetapkan; bisa dibatalkan', async () => {
+      const before = (await request(http).get(`/api/v1/projects/${projectId}`).set(as('admin'))).body.data;
+      const budget0 = Number(before.cost.total.budget);
+      const bkpu0 = Number(before.bkpuPenetapanPct);
+      await request(http).post(`/api/v1/projects/${projectId}/rap/revise`).set(as('pm')).send({ reason: 'Salah input harga' }).expect(403);
+      await request(http).post(`/api/v1/projects/${projectId}/rap/revise`).set(as('admin')).send({ reason: 'x' }).expect(422);
+      const r1 = (await request(http).post(`/api/v1/projects/${projectId}/rap/revise`).set(as('admin')).send({ reason: 'Koreksi harga beton' }).expect(201)).body.data;
+      expect(r1.locked).toBe(false);
+      expect(r1.isRevisionDraft).toBe(true);
+      expect(r1.budget.revision).toBe(2);
+      expect(r1.revisions[0]).toMatchObject({ revision: 2, revisionNote: 'Koreksi harga beton', approvedAt: null });
+      await request(http).post(`/api/v1/projects/${projectId}/rap/revise`).set(as('admin')).send({ reason: 'Revisi lain lagi' }).expect(422);
+      // edit draf revisi: naikkan satu harga
+      const items = r1.budget.items.map((i: any, k: number) => ({ bqItemId: i.bqItemId, section: i.section, code: i.code, description: i.description, unit: i.unit, category: i.category, quantity: String(i.quantity), unitRate: k === 0 ? String(Number(i.unitRate) + 100000) : String(i.unitRate) }));
+      const s1 = (await request(http).put(`/api/v1/projects/${projectId}/rap`).set(as('admin')).send({ items }).expect(200)).body.data;
+      // cost control masih memakai RAP rev 1
+      const mid = (await request(http).get(`/api/v1/projects/${projectId}`).set(as('admin'))).body.data;
+      expect(Number(mid.cost.total.budget)).toBeCloseTo(budget0, 2);
+      expect(mid.rap.revisionDraft).toBe(2);
+      // batalkan → kembali ke rev 1
+      await request(http).delete(`/api/v1/projects/${projectId}/rap/revision`).set(as('pm')).expect(403);
+      const c = (await request(http).delete(`/api/v1/projects/${projectId}/rap/revision`).set(as('admin')).expect(200)).body.data;
+      expect(c.locked).toBe(true);
+      expect(c.budget.revision).toBe(1);
+      // revisi lagi, simpan, tetapkan tanpa hitung ulang BK/PU
+      await request(http).post(`/api/v1/projects/${projectId}/rap/revise`).set(as('admin')).send({ reason: 'Koreksi harga beton' }).expect(201);
+      await request(http).put(`/api/v1/projects/${projectId}/rap`).set(as('admin')).send({ items }).expect(200);
+      const a = (await request(http).post(`/api/v1/projects/${projectId}/rap/approve`).set(as('admin')).send({}).expect(201)).body.data;
+      expect(a.locked).toBe(true);
+      expect(a.revisions.map((x: any) => x.revision)).toEqual([2, 1]);
+      const after = (await request(http).get(`/api/v1/projects/${projectId}`).set(as('admin'))).body.data;
+      expect(Number(after.cost.total.budget)).toBeCloseTo(Number(s1.totals.rap), 2);
+      expect(Number(after.bkpuPenetapanPct)).toBeCloseTo(bkpu0, 2);
+      // revisi ke-3 dengan hitung ulang BK/PU
+      await request(http).post(`/api/v1/projects/${projectId}/rap/revise`).set(as('admin')).send({ reason: 'Penyesuaian akhir' }).expect(201);
+      const a3 = (await request(http).post(`/api/v1/projects/${projectId}/rap/approve`).set(as('admin')).send({ recomputeBkpu: true }).expect(201)).body.data;
+      const after3 = (await request(http).get(`/api/v1/projects/${projectId}`).set(as('admin'))).body.data;
+      expect(Number(after3.bkpuPenetapanPct)).toBeCloseTo(a3.totals.bkpuPct, 2);
+    });
     it('proyek manual: RAP kosong bisa diisi tanpa acuan RAB; RAP kosong tidak bisa ditetapkan', async () => {
       const p = await request(http).post('/api/v1/projects').set(as('admin')).send({ name: 'Proyek manual RAP', contractValue: '500000000' }).expect(201);
       await request(http).post(`/api/v1/projects/${p.body.data.id}/rap/approve`).set(as('admin')).expect(422);
