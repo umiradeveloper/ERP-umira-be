@@ -589,9 +589,90 @@ export class ProjectsService {
     return r;
   }
 
+  /** Earned value sederhana: EV = budget RAP × progres fisik; CPI = EV ÷ actual (>1 = lebih hemat dari rencana) */
+  private earned(budget: Prisma.Decimal, actual: Prisma.Decimal, progressPct: Prisma.Decimal | number, usedPct: number) {
+    const ev = D(budget).mul(D(progressPct)).div(100).toDecimalPlaces(2);
+    const cpi = D(actual).gt(0) && ev.gt(0) ? ev.div(actual).toDecimalPlaces(3).toNumber() : null;
+    // Selisih % biaya terpakai (actual+commitment) dengan % progres fisik; positif = biaya mendahului progres
+    const costAhead = Math.round((usedPct - Number(progressPct)) * 100) / 100;
+    return { earnedValue: ev, cpi, costAheadPct: costAhead };
+  }
+
   async costPortfolio(u: AuthUser) {
-    const rows = await this.list(u);
-    return rows.filter((p) => !['CANCELLED'].includes(p.status));
+    const rows = (await this.list(u)).filter((p) => !['CANCELLED'].includes(p.status));
+    const buckets = await this.cost.buckets(u.tenantId, rows.map((p) => p.id));
+    return rows.map((p) => {
+      const sum = this.cost.summarize(buckets.get(p.id));
+      return { ...p, categories: sum.rows, ...this.earned(sum.total.budget, sum.total.actual, p.progressPct, sum.total.usedPct) };
+    });
+  }
+
+  /** Detail cost control satu proyek: per kategori, actual cost (sumber invoice), commitment (PO terbuka), tren bulanan */
+  async costDetail(u: AuthUser, id: string) {
+    const t = u.tenantId;
+    const p = notFound(await this.prisma.project.findFirst({ where: { id, tenantId: t } }), 'Proyek');
+    const [buckets, costs, poItems, rab, bkpu, rapBudget] = await Promise.all([
+      this.cost.buckets(t, [id]),
+      this.prisma.projectCost.findMany({ where: { tenantId: t, projectId: id }, orderBy: { costDate: 'desc' } }),
+      this.prisma.purchaseOrderItem.findMany({
+        where: { tenantId: t, po: { projectId: id, status: { in: [...COMMITTED_PO] } } },
+        select: {
+          id: true, description: true, unit: true, quantity: true, invoicedQty: true, receivedQty: true, unitPrice: true, category: true,
+          po: { select: { id: true, number: true, status: true, orderDate: true, deliveryDate: true, supplier: { select: { name: true } } } },
+        },
+      }),
+      this.prisma.bqItem.aggregate({ where: { tenantId: t, projectId: id }, _sum: { amount: true } }),
+      this.bkpu(t, [p]),
+      this.prisma.budget.findFirst({ where: { tenantId: t, projectId: id, isBaseline: true }, orderBy: { revision: 'desc' }, select: { approvedAt: true, name: true } }),
+    ]);
+    const sum = this.cost.summarize(buckets.get(id));
+
+    // sumber actual: invoice supplier (sourceType SINV_*)
+    const invIds = [...new Set(costs.filter((c) => c.sourceType.startsWith('SINV') && c.sourceId).map((c) => c.sourceId!))];
+    const invs = invIds.length
+      ? await this.prisma.supplierInvoice.findMany({ where: { tenantId: t, id: { in: invIds } }, select: { id: true, number: true, supplierRef: true, supplier: { select: { name: true } }, po: { select: { id: true, number: true } } } })
+      : [];
+    const invMap = new Map(invs.map((i) => [i.id, i]));
+
+    const commitments = poItems
+      .map((i) => {
+        const open = i.quantity.minus(i.invoicedQty);
+        return {
+          id: i.id, poId: i.po.id, poNumber: i.po.number, poStatus: i.po.status, supplier: i.po.supplier.name, orderDate: i.po.orderDate, deliveryDate: i.po.deliveryDate,
+          description: i.description, unit: i.unit, category: i.category, openQty: open, receivedQty: i.receivedQty, unitPrice: i.unitPrice, amount: open.mul(i.unitPrice).toDecimalPlaces(2),
+        };
+      })
+      .filter((c) => c.openQty.gt(0))
+      .sort((a, b) => b.amount.comparedTo(a.amount));
+
+    // tren bulanan actual (kumulatif) untuk grafik
+    const byMonth = new Map<string, Prisma.Decimal>();
+    for (const c of costs) {
+      const k = c.costDate.toISOString().slice(0, 7);
+      byMonth.set(k, (byMonth.get(k) ?? ZERO).plus(c.amount));
+    }
+    let cum = ZERO;
+    const trend = [...byMonth.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([month, amount]) => {
+      cum = cum.plus(amount);
+      return { month, amount, cumulative: cum };
+    });
+
+    const rabTotal = D(rab._sum.amount);
+    return {
+      project: {
+        id: p.id, code: p.code, name: p.name, status: p.status, contractValue: p.contractValue, progressPct: p.progressPct, plannedPct: p.plannedPct,
+        rabTotal, rapApprovedAt: rapBudget?.approvedAt ?? null, ...bkpu.get(p.id)!,
+      },
+      summary: sum,
+      ...this.earned(sum.total.budget, sum.total.actual, p.progressPct, sum.total.usedPct),
+      forecastMargin: sum.total.budget.gt(0) ? (rabTotal.gt(0) ? rabTotal : p.contractValue).minus(sum.total.eac) : null,
+      costs: costs.map((c) => {
+        const inv = c.sourceId ? invMap.get(c.sourceId) : undefined;
+        return { ...c, invoiceId: inv?.id ?? null, invoiceNumber: inv?.number ?? null, supplierRef: inv?.supplierRef ?? null, supplier: inv?.supplier.name ?? null, poId: inv?.po?.id ?? null, poNumber: inv?.po?.number ?? null };
+      }),
+      commitments,
+      trend,
+    };
   }
 }
 
@@ -630,6 +711,8 @@ export class ProjectsController {
   daily(@CurrentUser() u: AuthUser, @Param('id') id: string, @Body() dto: DailyReportDto) { return this.svc.addDailyReport(u, id, dto); }
   @Get('reports/cost-control') @Perm('cost:read')
   portfolio(@CurrentUser() u: AuthUser) { return this.svc.costPortfolio(u); }
+  @Get('reports/cost-control/:id') @Perm('cost:read')
+  costDetail(@CurrentUser() u: AuthUser, @Param('id') id: string) { return this.svc.costDetail(u, id); }
 }
 
 @Module({ controllers: [ProjectsController], providers: [ProjectsService, CostService], exports: [CostService, ProjectsService] })

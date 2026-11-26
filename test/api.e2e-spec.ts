@@ -644,6 +644,27 @@ describe('Contractor ERP API (e2e)', () => {
     });
   });
 
+  describe('Cost control lengkap', () => {
+    it('portofolio memuat kategori & earned value; detail proyek memuat actual, commitment, tren', async () => {
+      const port = (await request(http).get('/api/v1/reports/cost-control').set(as('admin')).expect(200)).body.data;
+      const a = port.find((x: any) => x.id === projectA);
+      expect(a.categories.map((c: any) => c.category)).toContain('MATERIAL');
+      expect(a).toHaveProperty('earnedValue');
+      expect(a).toHaveProperty('costAheadPct');
+      const d = (await request(http).get(`/api/v1/reports/cost-control/${projectA}`).set(as('admin')).expect(200)).body.data;
+      expect(d.project.id).toBe(projectA);
+      expect(d.summary.rows.length).toBeGreaterThan(0);
+      expect(Array.isArray(d.commitments)).toBe(true);
+      expect(Array.isArray(d.trend)).toBe(true);
+      const totalActual = d.costs.reduce((x: number, c: any) => x + Number(c.amount), 0);
+      expect(totalActual).toBeCloseTo(Number(d.summary.total.actual), 0);
+      const totalCommit = d.commitments.reduce((x: number, c: any) => x + Number(c.amount), 0);
+      expect(totalCommit).toBeCloseTo(Number(d.summary.total.commitment), 0);
+      if (d.costs.length) expect(d.costs[0].invoiceNumber).toBeTruthy();
+      await request(http).get(`/api/v1/reports/cost-control/${projectA}`).set(as('pm')).expect((r) => expect([200, 403]).toContain(r.status));
+    });
+  });
+
   describe('Ukuran request', () => {
     it('impor BQ besar (>100 KB) diterima; melebihi BODY_LIMIT dijawab 413 yang jelas', async () => {
       const t = (await request(http).post('/api/v1/tenders').set(as('admin')).send({ title: 'Tender besar' }).expect(201)).body.data;
