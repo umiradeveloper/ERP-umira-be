@@ -2,28 +2,21 @@ import './env';
 import 'reflect-metadata';
 import { Logger, ValidationPipe } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
+import type { NestExpressApplication } from '@nestjs/platform-express';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { AppModule } from './app.module';
-import { json, urlencoded } from 'express';
+import { configureBodyLimit } from './common/body-limit';
 
 async function bootstrap() {
   for (const k of ['DATABASE_URL', 'JWT_ACCESS_SECRET']) {
     if (!process.env[k]) throw new Error(`Environment ${k} belum di-set (lihat backend/.env.example)`);
   }
 
-  const app = await NestFactory.create(AppModule);
+  const app = await NestFactory.create<NestExpressApplication>(AppModule);
+  configureBodyLimit(app);
   app.setGlobalPrefix('api/v1');
   app.enableCors({ origin: (process.env.WEB_ORIGIN ?? 'http://localhost:3000').split(','), credentials: true });
   app.useGlobalPipes(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true }));
-
-   // Maksimum JSON 50 MB
-  app.use(json({ limit: '50mb' }));
-
-  // Maksimum URL encoded 50 MB
-  app.use(urlencoded({
-    extended: true,
-    limit: '50mb',
-  }));
 
   const config = new DocumentBuilder()
     .setTitle('Contractor ERP API')

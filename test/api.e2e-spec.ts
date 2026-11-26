@@ -11,6 +11,8 @@ import { Test } from '@nestjs/testing';
 import { PrismaClient } from '@prisma/client';
 import * as bcrypt from 'bcryptjs';
 import request from 'supertest';
+import type { NestExpressApplication } from '@nestjs/platform-express';
+import { configureBodyLimit } from '../src/common/body-limit';
 import { AppModule } from '../src/app.module';
 import { deleteTenant } from '../prisma/cleanup';
 import { createServer, type Server } from 'node:http';
@@ -74,7 +76,9 @@ describe('Contractor ERP API (e2e)', () => {
   beforeAll(async () => {
     tenantIds.push((await createTenant(A)).id, (await createTenant(B)).id);
     const mod = await Test.createTestingModule({ imports: [AppModule] }).compile();
-    app = mod.createNestApplication();
+    app = mod.createNestApplication<NestExpressApplication>();
+    process.env.BODY_LIMIT = '1mb';
+    configureBodyLimit(app as NestExpressApplication);
     app.setGlobalPrefix('api/v1');
     app.useGlobalPipes(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true }));
     await app.init();
@@ -602,6 +606,54 @@ describe('Contractor ERP API (e2e)', () => {
       const after = (await request(http).post('/api/v1/auth/login').send({ tenant: A, email: `pm@${A}.test`, password: PASS }).expect(201)).body.data.user;
       expect(after.menus).toEqual(['/dashboard', '/projects']);
       await request(http).patch(`/api/v1/roles/${pmRole.id}`).set(as('admin')).send({ name: 'Project Manager', permissions: pmRole.permissions, menus: null }).expect(200);
+    });
+  });
+
+  describe('Progres dalam Rupiah', () => {
+    it('progres bisa diisi Rp (dibandingkan total RAB) atau %, tidak boleh melebihi RAB', async () => {
+      const t = (await request(http).post('/api/v1/tenders').set(as('admin')).send({ title: 'Tender progres Rp' }).expect(201)).body.data;
+      await request(http).put(`/api/v1/tenders/${t.id}/items`).set(as('admin')).send({ items: [
+        { section: 'A', code: 'A.1', description: 'Galian', unit: 'm3', category: 'LABOR', quantity: '100', unitCost: '50000' },
+        { section: 'B', code: 'B.1', description: 'Beton', unit: 'm3', category: 'MATERIAL', quantity: '20', unitCost: '1000000' },
+      ] }).expect(200);
+      await request(http).post(`/api/v1/tenders/${t.id}/submit`).set(as('admin')).expect(201);
+      const pid = (await request(http).post(`/api/v1/tenders/${t.id}/decision`).set(as('admin')).send({ decision: 'WON' }).expect(201)).body.data.projectId;
+      await request(http).patch(`/api/v1/projects/${pid}`).set(as('admin')).send({ status: 'ACTIVE' }).expect(200);
+      const p0 = (await request(http).get(`/api/v1/projects/${pid}`).set(as('admin')).expect(200)).body.data;
+      expect(p0.progressBase.source).toBe('RAB');
+      const base = Number(p0.progressBase.value);
+      expect(base).toBeGreaterThan(0);
+
+      // Rupiah → persen
+      const half = (base / 2).toFixed(2);
+      const e = (await request(http).post(`/api/v1/projects/${pid}/progress`).set(as('admin')).send({ reportDate: '2026-11-20', plannedValue: (base * 0.6).toFixed(2), actualValue: half }).expect(201)).body.data;
+      expect(Number(e.actualPct)).toBeCloseTo(50, 3);
+      expect(Number(e.plannedPct)).toBeCloseTo(60, 3);
+      expect(Number(e.actualValue)).toBeCloseTo(base / 2, 1);
+      expect(Number(e.baseValue)).toBeCloseTo(base, 1);
+      // persen → Rupiah
+      const e2 = (await request(http).post(`/api/v1/projects/${pid}/progress`).set(as('admin')).send({ reportDate: '2026-11-27', plannedPct: '70', actualPct: '65' }).expect(201)).body.data;
+      expect(Number(e2.actualValue)).toBeCloseTo(base * 0.65, 1);
+      // melebihi RAB ditolak
+      const over = await request(http).post(`/api/v1/projects/${pid}/progress`).set(as('admin')).send({ reportDate: '2026-11-28', plannedPct: '80', actualValue: String(base + 1) }).expect(422);
+      expect(over.body.error.code).toBe('PROGRESS_OVER_RAB');
+      // salah satu harus diisi
+      await request(http).post(`/api/v1/projects/${pid}/progress`).set(as('admin')).send({ reportDate: '2026-11-28', plannedPct: '80' }).expect(422);
+      const p1 = (await request(http).get(`/api/v1/projects/${pid}`).set(as('admin'))).body.data;
+      expect(Number(p1.progressPct)).toBeCloseTo(65, 3);
+    });
+  });
+
+  describe('Ukuran request', () => {
+    it('impor BQ besar (>100 KB) diterima; melebihi BODY_LIMIT dijawab 413 yang jelas', async () => {
+      const t = (await request(http).post('/api/v1/tenders').set(as('admin')).send({ title: 'Tender besar' }).expect(201)).body.data;
+      const row = (i: number) => ({ section: 'A. PEKERJAAN', code: `A.${i}`, description: `Pekerjaan uraian panjang nomor ${i} `.repeat(3), unit: 'm3', category: 'MATERIAL', quantity: '12.5', unitCost: '150000' });
+      const items = Array.from({ length: 1500 }, (_, i) => row(i + 1));
+      expect(JSON.stringify({ items }).length).toBeGreaterThan(200_000);
+      await request(http).put(`/api/v1/tenders/${t.id}/items`).set(as('admin')).send({ items }).expect(200);
+      const huge = await request(http).put(`/api/v1/tenders/${t.id}/items`).set(as('admin')).set('content-type', 'application/json')
+        .send(JSON.stringify({ items: Array.from({ length: 6000 }, (_, i) => row(i + 1)) })).expect(413);
+      expect(huge.body.error.code).toBe('PAYLOAD_TOO_LARGE');
     });
   });
 

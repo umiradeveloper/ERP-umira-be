@@ -394,6 +394,11 @@ model ProgressEntry {
   reportDate  DateTime
   plannedPct  Decimal  @db.Decimal(7, 4)
   actualPct   Decimal  @db.Decimal(7, 4)
+  /// Nilai prestasi kumulatif (Rp) — dibandingkan dengan total RAB (basis)
+  plannedValue Decimal? @db.Decimal(20, 2)
+  actualValue  Decimal? @db.Decimal(20, 2)
+  /// Total RAB saat progres dicatat (basis % ⇄ Rp)
+  baseValue    Decimal? @db.Decimal(20, 2)
   notes       String?  @db.Text
   createdBy   String   @db.Char(36)
   createdAt   DateTime @default(now())

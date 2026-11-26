@@ -47,10 +47,13 @@ class RapItemDto {
 class RapDto {
   @ValidateNested({ each: true }) @Type(() => RapItemDto) items!: RapItemDto[];
 }
+/** Progres kumulatif: isi dalam persen (plannedPct/actualPct) ATAU Rupiah (plannedValue/actualValue) terhadap total RAB */
 class ProgressDto {
   @IsDateString() reportDate!: string;
-  @IsNumberString() plannedPct!: string;
-  @IsNumberString() actualPct!: string;
+  @IsOptional() @IsNumberString() plannedPct?: string;
+  @IsOptional() @IsNumberString() actualPct?: string;
+  @IsOptional() @IsNumberString() plannedValue?: string;
+  @IsOptional() @IsNumberString() actualValue?: string;
   @IsOptional() @IsString() notes?: string;
 }
 class DailyReportDto {
@@ -254,6 +257,7 @@ export class ProjectsService {
     const cost = this.cost.summarize(buckets.get(id));
     const bkpu = (await this.bkpu(u.tenantId, [p])).get(p.id)!;
     const rapBudget = await this.prisma.budget.findFirst({ where: { tenantId: u.tenantId, projectId: p.id, isBaseline: true }, orderBy: { revision: 'desc' }, select: { approvedAt: true, _count: { select: { items: true } } } });
+    const progressBase = await this.progressBase(u.tenantId, p);
     const billedGross = invoices.filter((i) => !['DRAFT', 'CANCELLED'].includes(i.status)).reduce((a, i) => a.plus(i.grossAmount), ZERO);
     const received = invoices.reduce((a, i) => a.plus(i.paidAmount), ZERO);
     return {
@@ -261,6 +265,7 @@ export class ProjectsService {
       ...bkpu,
       rap: { approvedAt: rapBudget?.approvedAt ?? null, items: rapBudget?._count.items ?? 0 },
       progress,
+      progressBase: { value: progressBase.base, source: progressBase.source },
       dailyReports,
       cost,
       finance: {
@@ -534,17 +539,43 @@ export class ProjectsService {
     return res;
   }
 
+  /** Basis progres Rupiah: total RAB (item BQ); proyek tanpa RAB memakai nilai kontrak */
+  async progressBase(tenantId: string, p: { id: string; contractValue: Prisma.Decimal }) {
+    const rab = await this.prisma.bqItem.aggregate({ where: { tenantId, projectId: p.id }, _sum: { amount: true } });
+    const total = D(rab._sum.amount);
+    return total.gt(0) ? { base: total.toDecimalPlaces(2), source: 'RAB' as const } : { base: D(p.contractValue).toDecimalPlaces(2), source: 'CONTRACT' as const };
+  }
+
   async addProgress(u: AuthUser, id: string, dto: ProgressDto) {
     const p = notFound(await this.prisma.project.findFirst({ where: { id, tenantId: u.tenantId } }), 'Proyek');
     if (!['ACTIVE', 'COMPLETION'].includes(p.status)) throw new BusinessError('Progres hanya dapat dicatat untuk proyek aktif');
-    const actual = D(dto.actualPct), planned = D(dto.plannedPct);
-    if (actual.lt(0) || actual.gt(100) || planned.lt(0) || planned.gt(100)) throw new BusinessError('Persentase harus 0–100');
+    const { base } = await this.progressBase(u.tenantId, p);
+    const fmt = (v: Prisma.Decimal) => `Rp ${v.toNumber().toLocaleString('id-ID', { maximumFractionDigits: 2 })}`;
+    // Satu sisi (rencana/aktual) boleh diisi persen atau Rupiah; yang lain dihitung dari total RAB
+    const side = (label: string, pctStr?: string, valStr?: string) => {
+      if (valStr !== undefined && valStr !== '') {
+        if (!base.gt(0)) throw new BusinessError('Total RAB/nilai kontrak masih 0, progres Rupiah tidak bisa dihitung. Isi dalam persen.');
+        const v = D(valStr).toDecimalPlaces(2);
+        if (v.lt(0)) throw new BusinessError(`Nilai ${label} tidak boleh negatif`);
+        if (v.gt(base)) throw new BusinessError(`Nilai ${label} ${fmt(v)} melebihi total RAB ${fmt(base)}`, 'PROGRESS_OVER_RAB');
+        return { pct: v.div(base).mul(100).toDecimalPlaces(4), value: v };
+      }
+      if (pctStr === undefined || pctStr === '') throw new BusinessError(`Isi progres ${label} dalam persen atau Rupiah`);
+      const pc = D(pctStr);
+      if (pc.lt(0) || pc.gt(100)) throw new BusinessError('Persentase harus 0–100');
+      return { pct: pc.toDecimalPlaces(4), value: base.gt(0) ? base.mul(pc).div(100).toDecimalPlaces(2) : null };
+    };
+    const actual = side('aktual', dto.actualPct, dto.actualValue);
+    const planned = side('rencana', dto.plannedPct, dto.plannedValue);
     return this.prisma.$transaction(async (tx) => {
       const e = await tx.progressEntry.create({
-        data: { tenantId: u.tenantId, projectId: id, reportDate: new Date(dto.reportDate), plannedPct: planned, actualPct: actual, notes: dto.notes, createdBy: u.userId },
+        data: {
+          tenantId: u.tenantId, projectId: id, reportDate: new Date(dto.reportDate), plannedPct: planned.pct, actualPct: actual.pct,
+          plannedValue: planned.value, actualValue: actual.value, baseValue: base.gt(0) ? base : null, notes: dto.notes, createdBy: u.userId,
+        },
       });
-      await tx.project.update({ where: { id }, data: { progressPct: actual, plannedPct: planned } });
-      await this.audit.log(u, 'PROGRESS', 'Project', id, { actual: dto.actualPct, planned: dto.plannedPct }, tx);
+      await tx.project.update({ where: { id }, data: { progressPct: actual.pct, plannedPct: planned.pct } });
+      await this.audit.log(u, 'PROGRESS', 'Project', id, { actual: actual.pct.toString(), planned: planned.pct.toString(), actualValue: actual.value?.toString(), plannedValue: planned.value?.toString() }, tx);
       return e;
     });
   }

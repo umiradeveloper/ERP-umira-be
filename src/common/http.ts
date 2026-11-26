@@ -79,6 +79,15 @@ export class AllExceptionsFilter implements ExceptionFilter {
       } else {
         message = body?.message ?? exception.message;
       }
+    } else if ((exception as any)?.type === 'entity.too.large') {
+      // body-parser: request melebihi BODY_LIMIT
+      status = HttpStatus.PAYLOAD_TOO_LARGE;
+      code = 'PAYLOAD_TOO_LARGE';
+      message = 'Data yang dikirim terlalu besar. Bagi impor menjadi beberapa file, atau naikkan BODY_LIMIT di server.';
+    } else if ((exception as any)?.type === 'entity.parse.failed') {
+      status = HttpStatus.BAD_REQUEST;
+      code = 'INVALID_JSON';
+      message = 'Format data tidak valid';
     } else if (exception instanceof Prisma.PrismaClientKnownRequestError) {
       if (exception.code === 'P2002') {
         status = HttpStatus.CONFLICT;
